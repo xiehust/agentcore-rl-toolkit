@@ -117,6 +117,7 @@ class AgentCoreAgentLoop(AgentLoopBase):
         max_turns_per_sid: int | None = None,
         history_mode: str = "tree",
         linear_on_nonlinear: str = "reset",
+        require_registered_sessions: bool = False,
         reward_mode: str = "built_in",
         reward_extra_info_defaults: dict | None = None,
         # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
@@ -178,6 +179,7 @@ class AgentCoreAgentLoop(AgentLoopBase):
             chat_template_kwargs=dict(self.apply_chat_template_kwargs or {}),
             history_mode=history_mode,
             linear_on_nonlinear=linear_on_nonlinear,
+            require_registered_sessions=require_registered_sessions,
         )
         # Default exp_id must be identical across all AgentLoopWorker processes of
         # one run, so derive it from verl's run identity instead of inventing one.

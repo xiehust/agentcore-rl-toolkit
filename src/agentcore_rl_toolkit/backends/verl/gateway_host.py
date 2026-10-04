@@ -154,12 +154,17 @@ def get_or_start_gateway(
     history_mode: str = "tree",
     chat_template_kwargs: dict | None = None,
     linear_on_nonlinear: str = "reset",
+    require_registered_sessions: bool = False,
 ) -> GatewayHandle:
     """Lazily create (or return) this process's RolloutGateway singleton.
 
     ``port=0`` auto-assigns — required when verl round-robins multiple
     AgentLoopWorkers onto one node. ``public_host`` overrides the advertised
     host for NAT setups where the Ray node IP is not ACR-reachable.
+
+    ``require_registered_sessions`` is process-shared: the gateway is a per-process
+    singleton, so the FIRST agent loop's value wins and later instances' values are
+    ignored (same as ``gateway_port``). Set it consistently across the run.
     """
     global _HANDLE
     with _LOCK:
@@ -176,6 +181,7 @@ def get_or_start_gateway(
             max_turns_per_sid=max_turns_per_sid,
             history_mode=history_mode,
             linear_on_nonlinear=linear_on_nonlinear,
+            require_registered_sessions=require_registered_sessions,
         )
         loop, runner, bound_port, thread = _serve_in_thread(gateway.app, host, port)
         base_url = f"http://{_url_host(public_host or _node_ip())}:{bound_port}"

@@ -21,6 +21,16 @@
   # tps_limit: 5                   # client-side invoke rate cap (conservative default;
   #                                # raise toward your account's ACR InvokeAgentRuntime quota)
   # gateway_port: 0                # 0 = auto-assign per worker process
+  # require_registered_sessions: false
+  #                                # opt-in auth guard. When true, the gateway only
+  #                                # serves session ids it pre-registered for a
+  #                                # rollout; any other Bearer gets 401 instead of
+  #                                # implicitly opening a session. Process-shared like
+  #                                # gateway_port (the first loop's value wins).
+  #                                # ENABLE whenever the gateway port is reachable from
+  #                                # outside a trusted network, so strangers can't POST
+  #                                # an arbitrary Bearer for free inference and pollute
+  #                                # the trajectory trees.
   # gateway_public_host: <ip>      # host advertised to agents for gateway callbacks.
   #                                # Default: the node IP Ray reports (fine when ACR
   #                                # containers can route to the trainer nodes, as in

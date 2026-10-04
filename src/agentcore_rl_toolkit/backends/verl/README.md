@@ -105,6 +105,18 @@ verl main_ppo (v1) ──> AgentLoopWorker ──> AgentCoreAgentLoop.run()
   becomes its own training row (`run()` returns `list[AgentLoopOutput]`) — hence the
   hard `trainer.use_v1=true` requirement.
 
+**Securing the gateway port.** By default the gateway opens a session on the first
+turn it sees for any Bearer, so if the port is reachable from outside a trusted
+network a stranger can POST `/v1/chat/completions` with an arbitrary Bearer — free
+inference plus garbage trajectory trees in the trainer. Set
+`require_registered_sessions: true` (on `AgentCoreAgentLoop`, forwarded to
+`get_or_start_gateway`/`RolloutGateway`) to refuse any sid the loop did not
+pre-register via `create_session` with a `401`; health and `/v1/models` probes stay
+unauthenticated. It defaults to `false` (unchanged behaviour) and is process-shared
+like `gateway_port` — the first agent loop's value wins. **Recommended whenever the
+gateway port is reachable from outside a trusted network** (public networking mode,
+NAT, or any setup where the trainer nodes are not on an isolated VPC).
+
 The agent must forward the trainer-supplied key when it constructs its model client:
 
 ```python
