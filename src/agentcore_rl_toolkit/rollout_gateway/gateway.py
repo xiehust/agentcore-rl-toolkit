@@ -46,6 +46,12 @@ class RolloutGateway:
             so the manager stays CLEAN (one sample per session). See ``linear.py``.
         linear_on_nonlinear: ``"reset"`` (default) | ``"error"`` | ``"passthrough"`` —
             behaviour when a turn breaks the append-only assumption (linear mode only).
+        require_registered_sessions: opt-in auth guard (default ``False``). When ``True``,
+            only sids pre-registered via ``create_session`` may drive a turn; any other
+            Bearer is refused ``401`` instead of implicitly opening a session. Enable it
+            whenever the gateway port is reachable from outside a trusted network (ACR
+            containers calling back to a trainer EC2), so a stranger cannot POST an
+            arbitrary Bearer for free inference and pollute the trajectory trees.
     """
 
     def __init__(
@@ -59,6 +65,7 @@ class RolloutGateway:
         linear_on_nonlinear: str = "reset",
         max_turns_per_sid: int | None = None,
         debug_callback: Any = None,
+        require_registered_sessions: bool = False,
     ) -> None:
         self.backend = backend
         self.renderer = renderer
@@ -91,6 +98,7 @@ class RolloutGateway:
                 manager=self.manager,  # SHARED across adapters -> one tree per sid
                 healer=self.healer,  # SHARED across adapters -> coherent canonical state
                 app=self.app,  # SHARED app -> all routes on one server
+                require_registered_sessions=require_registered_sessions,
             )
             self.adapters.append(adapter)
 
