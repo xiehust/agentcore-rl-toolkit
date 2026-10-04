@@ -1,0 +1,56 @@
+# Per-run agent-loop config for verl's `rollout.agent.agent_loop_config_path`.
+# Every key besides `name`/`_target_` is passed to AgentCoreAgentLoop.__init__
+# (see src/agentcore_rl_toolkit/backends/verl/agent_loop.py). `${oc.env:VAR}` is
+# OmegaConf env interpolation and ERRORS if VAR is unset, so ARNs/buckets never
+# get committed and a missing export fails loudly at worker init instead of
+# training on a wrong endpoint. env.sh exports all of these; train_qwen35_2b.sh
+# additionally guarantees GATEWAY_PUBLIC_HOST (IMDSv2) before launch.
+#
+# PLAN §4 values are used verbatim below; each is annotated with its source.
+- name: agentcore_agent
+  _target_: agentcore_rl_toolkit.backends.verl.agent_loop.AgentCoreAgentLoop
+
+  # ACR endpoint + result bucket. runtime.env (written by agent/create_runtime.sh)
+  # exports AGENT_RUNTIME_ARN; env.sh exports ACR_S3_BUCKET.
+  agent_runtime_arn: ${oc.env:AGENT_RUNTIME_ARN}
+  s3_bucket: ${oc.env:ACR_S3_BUCKET}
+
+  # exp_id -> S3 rollout prefix. Pinned to EXP_ID (env.sh: qwen35-2b-gsm8k) so the
+  # prefix is stable across restarts rather than derived from project/experiment
+  # name (which gets a `_smoke` suffix in smoke runs).
+  exp_id: ${oc.env:EXP_ID}
+
+  # PLAN §4: single model call ceiling. Cumulative trajectory stays bounded by
+  # rollout.response_length (4096) set in the training script.
+  max_tokens_per_turn: 1024
+
+  # PLAN §4: client-side InvokeAgentRuntime rate cap. 8 ~= 1/3 of the account's
+  # 25 new-sessions/s; 256 sessions/step submit in ~32s.
+  tps_limit: 8
+
+  # PLAN §4: math rollouts finish well under this; fail hung sessions fast rather
+  # than holding a TransferQueue slot for the 1800s library default.
+  max_rollout_time: 180
+
+  # Fixed gateway port so the trainer SG only opens one predictable port (PLAN
+  # §2.1). `${oc.decode:...}` turns the env string into an int, which the
+  # AgentCoreAgentLoop / gateway_host TCPSite require (verified with omegaconf:
+  # resolves to int 18765). env.sh exports GATEWAY_PORT=18765.
+  gateway_port: ${oc.decode:${oc.env:GATEWAY_PORT}}
+
+  # PLAN §2.1: ACR PUBLIC-mode containers reach the trainer via its public IPv4,
+  # not the Ray node IP. train_qwen35_2b.sh resolves this from IMDSv2 public-ipv4
+  # and exports GATEWAY_PUBLIC_HOST before launch.
+  gateway_public_host: ${oc.env:GATEWAY_PUBLIC_HOST}
+
+  # PLAN §2.1 hardening: the gateway is otherwise unauthenticated — anyone who
+  # reaches port 18765 could inject sessions. With this on, the adapter accepts
+  # only sids the trainer already registered via create_session (unguessable
+  # uuid4), returning 401 otherwise, so Bearer=sid becomes a one-time session
+  # token. Kwarg added by the gateway/adapter change tracked in PLAN §2.1;
+  # the gateway auth guard landed in this checkout (adapters/common.py); rejects unregistered Bearer sids with 401.
+  require_registered_sessions: true
+
+  # reward_mode defaults to "built_in" (the only supported mode): the ACR agent
+  # returns {"rewards": 0/1} in its S3 session result and that becomes rm_scores
+  # directly. Left at the default on purpose.
