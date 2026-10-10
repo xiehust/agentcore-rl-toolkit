@@ -116,6 +116,12 @@ class RolloutGateway:
         for adapter in self.adapters:
             adapter.open_session(sid, sampling_defaults=sampling_defaults, max_context_tokens=max_context_tokens)
 
+    def context_exhausted(self, sid: str) -> bool:
+        """True once any adapter answered a turn for ``sid`` with a context-limit
+        error. Per-session state consumed by ``finish_session``/``drop_session``,
+        so read it before draining the session."""
+        return any(getattr(adapter.store.get(sid), "context_exhausted", False) for adapter in self.adapters)
+
     async def finish_session(
         self,
         sid: str,

@@ -36,6 +36,17 @@ SYSTEM_PROMPT = (
 reward_fn = OfficeBenchReward()
 
 
+def _response_text(message: dict | None) -> str:
+    """The text of the agent's final message, or "" when it has no text block.
+
+    The final message can legitimately carry empty content or only non-text blocks,
+    so this never indexes into it: a logging line must not keep the reward from
+    being computed for a task the agent may well have completed.
+    """
+    content = (message or {}).get("content") or []
+    return "".join(block.get("text", "") for block in content if isinstance(block, dict))
+
+
 @app.rollout_entrypoint
 def invoke_agent(payload: dict):
     rollout_config = payload.get("_rollout", {})
@@ -95,7 +106,7 @@ def invoke_agent(payload: dict):
     logger.info(f"Task: {user_input}")
 
     response = agent(user_input)
-    logger.info(f"Agent response: {response.message['content'][0]['text']}")
+    logger.info(f"Agent response: {_response_text(response.message)}")
 
     # Collect full conversation history
     messages = [{"role": msg.get("role", "unknown"), "content": msg.get("content", [])} for msg in agent.messages]

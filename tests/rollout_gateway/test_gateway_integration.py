@@ -462,8 +462,12 @@ async def test_max_context_tokens_returns_context_window_error():
         )
         assert backend.calls == []  # backend never invoked
 
+        # the refusal is flagged per session, readable until the session is drained
+        assert gateway.context_exhausted(sid)
+        assert not gateway.context_exhausted("ep7:other")
         # a rejected input is not part of the trajectory
         assert await gateway.finish_session(sid) == []
+        assert not gateway.context_exhausted(sid)
 
 
 @pytest.mark.asyncio
@@ -481,6 +485,7 @@ async def test_anthropic_max_context_tokens_returns_context_window_error():
         assert error["error"]["type"] == "invalid_request_error"
         assert "maximum context length is 2 tokens" in error["error"]["message"]
         assert backend.calls == []
+        assert gateway.context_exhausted(sid)  # flagged on whichever adapter refused it
         assert await gateway.finish_session(sid) == []
 
 

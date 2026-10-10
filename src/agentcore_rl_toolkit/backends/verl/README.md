@@ -220,7 +220,7 @@ mode): the agent returns `{"rewards": ...}` in its session result (scalar or lis
 last element wins). The score becomes `rm_scores` directly and verl skips reward
 computation.
 
-- Failed rollouts (timeout, ACR error, non-200 `status_code`) score 0.0.
+- Failed rollouts that still train (see [Failure handling](#failure-handling)) score 0.0.
 - A healthy rollout that returns no reward is a contract violation: warned, scored 0.0.
 - A non-numeric `rewards` value raises because it indicates a recurring
   agent-side contract error. verl contains the exception to the affected prompt
@@ -302,6 +302,70 @@ session-level or partial-group failure handling in verl's replay buffer.
 The `training/rollout_failure/total_missing_sessions` metric reports
 `data.train_batch_size / parameter_sync_step * rollout.n` minus the number of
 materialized rollout sessions in each actor update, summed over a step's updates.
+
+## Failure handling
+
+A failed rollout is classified, then trained at reward 0, retried, or dropped. Rules
+match in order and never inspect error text:
+
+| Class | Matches | Action |
+|---|---|---|
+| `model` | the gateway answered a context-limit error for the session (`max_context_tokens` filled); the last captured turn ended with `finish_reason == "length"`; a timeout under `timeout_policy: penalize` | train at reward 0 (dropped if no tokens were captured) |
+| `timeout` | the `max_rollout_time` deadline passed (`timeout_policy: drop`) | drop |
+| `transient` | `invoke_async` raised (after boto retries), polling S3 raised, or `status_code == 500` with zero captured model turns | retry on a fresh session id, then drop |
+| `agent_error` | any other non-200 `status_code`, e.g. a traceback after model turns | drop (train at 0 with `drop_agent_errors: false`) |
+
+A non-numeric reward still raises, as described under [Rewards](#rewards).
+
+Dropping raises `RolloutDropped` (a `RuntimeError` with `.failure_class`) from the
+agent loop. With synchronous replay only that trajectory is lost, its siblings train,
+and it counts toward `total_missing_sessions`. With asynchronous replay, verl evicts
+and refills the whole prompt group (see above), so drops cost more there.
+
+A retry discards the old gateway session, waits a jittered 2–5 s, and invokes again
+under a new session id. The first attempt and all retries share one `max_rollout_time`
+deadline. No retry starts if the backoff would overrun the deadline, so a retried
+rollout never holds a step longer than an unretried one could.
+
+`agentcore_agent.yaml` kwargs:
+
+| Kwarg | Default | Meaning |
+|---|---|---|
+| `drop_agent_errors` | `true` | drop `agent_error` rollouts; `false` trains their partial traces at reward 0 (the old behaviour) |
+| `max_rollout_retries` | `1` | retries for `transient` failures; `0` drops them immediately |
+| `timeout_policy` | `drop` | `drop`, or `penalize` to train timed-out partial traces at reward 0 as `model` |
+
+Each decision logs one line at WARNING level:
+
+```text
+[rollout-failure] class=<model|transient|agent_error|timeout> action=<train|retry|drop> sid=<sid> step=<global_steps> reason=<first 200 chars, newlines replaced by spaces>
+```
+
+These lines come from agent-loop worker processes. Ray forwards worker output to the
+driver (`log_to_driver` defaults to true, and verl does not override it), with a
+`(AgentLoopWorker pid=...)` prefix and possibly a logging-format prefix, so match the
+line anywhere, not at the start. Ray's driver-side deduplication (`RAY_DEDUP_LOGS`,
+on by default) ignores words containing digits, so it collapses lines that differ only
+in sid or step when different workers emit them within 5 s. It prints them once
+followed by `[repeated Nx across cluster]`. Set
+`RAY_DEDUP_LOGS_ALLOW_REGEX='\[rollout-failure\]'` in the driver environment to keep
+every line, or count with the metrics below.
+
+`agentcore_sync` also reports, per step:
+
+- `training/rollout_failure/total_<class>_<action>` for `model_train`, `model_drop`,
+  `transient_retry`, `transient_drop`, `agent_error_train`, `agent_error_drop`, and
+  `timeout_drop`. Agent loops record each decision in a named Ray actor
+  (`agentcore_rollout_failure_stats`) that the trainer owns and reads at the end of
+  the step, before validation.
+- `training/rollout_failure/drop_fraction`: `total_missing_sessions` divided by
+  `data.train_batch_size * rollout.n`.
+
+If `drop_fraction` exceeds `trainer.v1.agentcore_max_drop_fraction` (default `0.5`;
+`null` disables the guard) for `trainer.v1.agentcore_drop_guard_steps` (default `3`)
+consecutive steps, the trainer raises `RolloutFailureGuardError` and includes the
+step's per-class counts in the message. Both keys are new to verl's config, so pass
+them with `+`, e.g. `+trainer.v1.agentcore_max_drop_fraction=0.3`.
 
 ## Troubleshooting
 

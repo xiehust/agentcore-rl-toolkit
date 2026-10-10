@@ -20,6 +20,7 @@ from verl.trainer.ppo.v1 import (
 from .trainer_mixins import (
     AdvantageZeroMetricsMixin,
     AgentLoopMetricsMixin,
+    RolloutFailureGuardMixin,
     RoundRobinAgentLoopDispatchMixin,
     VariableRowBatchingMixin,
 )
@@ -52,13 +53,16 @@ class _AgentCoreTrainerBase:
 
 
 # One registered name per verl backend. VariableRowBatchingMixin comes last of the mixins so
-# it stays closest to the trainer whose batching seams it overrides.
+# it stays closest to the trainer whose batching seams it overrides. The rollout-failure
+# guard is sync-only: its drop fraction assumes failed groups stay sampleable, while the
+# async trainers evict and refill them.
 @register_trainer("agentcore_sync")
 class AgentCorePPOTrainerSync(
     _AgentCoreTrainerBase,
     RoundRobinAgentLoopDispatchMixin,
     AgentLoopMetricsMixin,
     AdvantageZeroMetricsMixin,
+    RolloutFailureGuardMixin,
     VariableRowBatchingMixin,
     PPOTrainerSync,
 ):
