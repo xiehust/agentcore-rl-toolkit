@@ -41,11 +41,15 @@ class Session:
     """Per-sid adapter state: sampling defaults and context budget.
 
     Trajectory state lives in the shared TrajectoryManager (BaseAdapter.manager),
-    not here.
+    not here. ``context_exhausted`` is set once this adapter answered a turn with
+    a context-limit error (the prompt filled ``max_context_tokens``), so a caller
+    can tell a model-caused failure from an infrastructure one without matching
+    error text.
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
+    context_exhausted: bool = False
 
 
 @dataclasses.dataclass
@@ -423,6 +427,7 @@ class BaseAdapter:
                         len(prompt_ids),
                         s.max_context_tokens,
                     )
+                    s.context_exhausted = True
                     return self._context_limit_error(
                         prompt_tokens=len(prompt_ids),
                         max_context_tokens=s.max_context_tokens,

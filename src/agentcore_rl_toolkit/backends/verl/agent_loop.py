@@ -16,6 +16,7 @@ sub-agent forks), which only the v1 TransferQueue path consumes.
 
 import asyncio
 import logging
+import random
 import time
 import uuid
 from typing import Any
@@ -30,8 +31,18 @@ from agentcore_rl_toolkit.client import RolloutClient
 from agentcore_rl_toolkit.rollout_gateway import BaseTrace, TraceRecord
 
 from .gateway_host import GatewayHandle, get_or_start_gateway
+from .rollout_failure import (
+    TIMEOUT_POLICIES,
+    RolloutDropped,
+    classify_failure,
+    log_failure,
+    record_failure,
+)
 
 logger = logging.getLogger(__name__)
+
+# Jittered pause before retrying a transient failure, in seconds (tests shorten it).
+_RETRY_BACKOFF_S = (2.0, 5.0)
 
 # Agent loops are instantiated per trajectory, so same-config instances MUST share
 # one client: the client owns the LocalRateLimiter, and a fresh limiter per instance
@@ -122,6 +133,10 @@ class AgentCoreAgentLoop(AgentLoopBase):
         reward_extra_info_defaults: dict | None = None,
         # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
         reward_thresholds: dict | None = None,
+        # Failure policy (see rollout_failure.py and the README's failure-handling section).
+        drop_agent_errors: bool = True,
+        max_rollout_retries: int = 1,
+        timeout_policy: str = "drop",
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -143,6 +158,13 @@ class AgentCoreAgentLoop(AgentLoopBase):
             )
         if reward_mode != "built_in":
             raise ValueError(f"reward_mode must be 'built_in', got {reward_mode!r}")
+        if timeout_policy not in TIMEOUT_POLICIES:
+            raise ValueError(f"timeout_policy must be one of {list(TIMEOUT_POLICIES)}, got {timeout_policy!r}")
+        if type(max_rollout_retries) is not int or max_rollout_retries < 0:  # noqa: E721 - reject bool
+            raise ValueError(f"max_rollout_retries must be a non-negative integer, got {max_rollout_retries!r}")
+        self.drop_agent_errors = bool(drop_agent_errors)
+        self.max_rollout_retries = max_rollout_retries
+        self.timeout_policy = timeout_policy
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -224,78 +246,83 @@ class AgentCoreAgentLoop(AgentLoopBase):
     # TQ path accepts AgentLoopOutput | list[AgentLoopOutput] (one row per
     # trajectory-tree leaf); __init__ asserts trainer.use_v1 accordingly.
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput]:  # type: ignore[override]
-        sid = str(uuid.uuid4())  # gateway Bearer sid == ACR runtimeSessionId (36 chars >= ACR's 33 min)
         start = time.monotonic()
+        # The first attempt and every retry share one deadline, so a retried rollout
+        # never holds a synchronous step longer than an unretried one could.
+        deadline = start + self.max_rollout_time
+        global_steps = int(kwargs.get("global_steps", 0))
 
         # Built before any session/ACR state exists: a payload-contract violation
         # is a config error that would hit every rollout — raise it loudly rather
         # than degrading each rollout into an inert row.
         payload = self._build_payload(kwargs)
 
-        self._gateway.gateway.create_session(
-            sid,
-            sampling_defaults=self._sampling_defaults(sampling_params),
-            max_context_tokens=self.max_context_tokens,
-        )
-
-        result: dict[str, Any] = {}
-        error: str | None = None
-        try:
-            future = await self._client.invoke_async(
-                payload,
-                session_id=sid,
-                input_id=str(kwargs.get("uid", sid)),
-                # OpenAI-SDK convention: base_url includes the /v1 prefix (the
-                # client appends /chat/completions); agents pass it verbatim.
-                # TODO: not directly usable by Anthropic-SDK agents (that SDK
-                # appends /v1/messages without normalizing an existing /v1).
-                base_url=f"{self._gateway.base_url}/v1",
-                model_id=self.model_id,
-                # The gateway keys trajectory capture off the api-key slot; hand the
-                # agent its session key explicitly instead of relying on the agent
-                # deriving it from the ACR runtime session id (sid doubles as the
-                # runtimeSessionId, so older agent images that still send
-                # context.session_id produce the same value).
-                api_key=sid,
+        gateway = self._gateway.gateway
+        attempt = 0
+        while True:
+            attempt += 1
+            sid = str(uuid.uuid4())  # gateway Bearer sid == ACR runtimeSessionId (36 chars >= ACR's 33 min)
+            gateway.create_session(
+                sid,
+                sampling_defaults=self._sampling_defaults(sampling_params),
+                max_context_tokens=self.max_context_tokens,
             )
-            result = await future.result_async(timeout=self.max_rollout_time)
-        except asyncio.TimeoutError:
-            error = f"rollout timed out after {self.max_rollout_time}s"
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
-        if error:
-            logger.warning("ACR rollout failed (sid=%s): %s", sid, error)
+            result, error, phase = await self._invoke_once(payload, sid, kwargs, deadline)
 
-        status_code = result.get("status_code")
-        if status_code is not None and status_code != 200 and error is None:
-            # Agent-side failure saved to S3; a partial trace may still exist.
-            error = f"agent returned status_code={status_code}: {result.get('stop_reason', 'unknown')}"
-            logger.warning("ACR rollout failed (sid=%s): %s", sid, error)
+            failure_class: str | None = None
+            if error is not None:
+                # Read the per-session signals before the session is drained.
+                failure_class = classify_failure(
+                    phase=phase,
+                    status_code=result.get("status_code"),
+                    num_turns=gateway.manager.turn_count(sid),
+                    context_exhausted=gateway.context_exhausted(sid),
+                    last_finish_reason=gateway.manager.last_finish_reason(sid),
+                    timeout_policy=self.timeout_policy,
+                )
+            if failure_class == "transient" and attempt <= self.max_rollout_retries:
+                backoff = random.uniform(*_RETRY_BACKOFF_S)
+                if time.monotonic() + backoff < deadline:
+                    await self._report_failure("transient", "retry", sid, global_steps, error)
+                    await gateway.drop_session(sid)
+                    self._gateway.backend.pop_extra_fields(sid)
+                    await asyncio.sleep(backoff)
+                    continue
+                error = f"{error} (no time left in max_rollout_time to retry)"
+            break
 
-        num_turns = self._gateway.gateway.manager.turn_count(sid)
-        records = await self._gateway.gateway.finish_session(sid, base_sample=BaseTrace(rollout_id=sid), reward=0.0)
+        num_turns = gateway.manager.turn_count(sid)
+        records = await gateway.finish_session(sid, base_sample=BaseTrace(rollout_id=sid), reward=0.0)
         records = [r for r in records if r.token_ids]
         engine_extra = self._gateway.backend.pop_extra_fields(sid)
         elapsed = time.monotonic() - start
 
         if not records:
             self._warn_if_static_session_capture(sid)
-            reason = error or "no model turns were captured"
-            raise RuntimeError(f"ACR rollout produced no trainable trajectory (sid={sid}): {reason}")
+        if failure_class is not None:
+            action = self._failure_action(failure_class, has_records=bool(records))
+            await self._report_failure(failure_class, action, sid, global_steps, error)
+            if action == "drop":
+                raise RolloutDropped(failure_class, f"sid={sid} attempts={attempt}: {error}")
+        elif not records:
+            raise RuntimeError(
+                f"ACR rollout produced no trainable trajectory (sid={sid}): no model turns were captured"
+            )
 
         reward = self._resolve_reward(result, error, sid)
 
         # v1's staleness metrics do int(tag["min_global_steps"]) — the tags must
         # always be real ints. The engine's extra_fields carry them for turns it
         # served; default to the dataloader step otherwise.
-        global_steps = int(kwargs.get("global_steps", 0))
         shared_extra = {
             # the session result is parsed JSON (RolloutFuture json.loads it) —
             # already plain python, no sanitizing needed
             "acr_result": result,
             "acr_session_id": sid,
             "num_trace_records": len(records),
+            "rollout_attempts": attempt,
             **({"acr_error": error} if error else {}),
+            **({"rollout_failure_class": failure_class} if failure_class else {}),
             "min_global_steps": global_steps,
             "max_global_steps": global_steps,
             **{k: v for k, v in engine_extra.items() if v is not None},
@@ -341,6 +368,75 @@ class AgentCoreAgentLoop(AgentLoopBase):
         return info
 
     # -- helpers ---------------------------------------------------------------
+
+    async def _invoke_once(
+        self, payload: dict[str, Any], sid: str, kwargs: dict[str, Any], deadline: float
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        """One invoke + wait. Returns ``(result, error, phase)``: ``phase`` is where it
+        failed (``"invoke"``, ``"poll"``, ``"timeout"``), or ``None`` if a result arrived;
+        ``error`` is ``None`` only for a ``status_code`` 200 (or absent) result."""
+        try:
+            future = await self._client.invoke_async(
+                payload,
+                session_id=sid,
+                input_id=str(kwargs.get("uid", sid)),
+                # OpenAI-SDK convention: base_url includes the /v1 prefix (the
+                # client appends /chat/completions); agents pass it verbatim.
+                # TODO: not directly usable by Anthropic-SDK agents (that SDK
+                # appends /v1/messages without normalizing an existing /v1).
+                base_url=f"{self._gateway.base_url}/v1",
+                model_id=self.model_id,
+                # The gateway keys trajectory capture off the api-key slot; hand the
+                # agent its session key explicitly instead of relying on the agent
+                # deriving it from the ACR runtime session id (sid doubles as the
+                # runtimeSessionId, so older agent images that still send
+                # context.session_id produce the same value).
+                api_key=sid,
+            )
+        except Exception as e:
+            return {}, f"{type(e).__name__}: {e}", "invoke"
+
+        timed_out = f"rollout timed out after {self.max_rollout_time}s"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await self._cancel_quietly(future)
+            return {}, timed_out, "timeout"
+        try:
+            result = await future.result_async(timeout=remaining)
+        except asyncio.TimeoutError:
+            return {}, timed_out, "timeout"  # result_async cancels the ACR session itself
+        except Exception as e:
+            # Stop the old ACR session before a retry starts a new one.
+            await self._cancel_quietly(future)
+            return {}, f"{type(e).__name__}: {e}", "poll"
+
+        status_code = result.get("status_code")
+        if status_code is not None and status_code != 200:
+            # Agent-side failure saved to S3; a partial trace may still exist.
+            return result, f"agent returned status_code={status_code}: {result.get('stop_reason', 'unknown')}", None
+        return result, None, None
+
+    @staticmethod
+    async def _cancel_quietly(future: Any) -> None:
+        try:
+            await future.cancel_async()
+        except Exception:
+            logger.debug("ACR session cancel failed", exc_info=True)
+
+    def _failure_action(self, failure_class: str, *, has_records: bool) -> str:
+        """``train`` (reward 0) or ``drop`` for a failure that will not be retried."""
+        if failure_class == "model":
+            trains = True
+        elif failure_class == "agent_error":
+            trains = not self.drop_agent_errors
+        else:  # transient (retries exhausted) and timeout
+            trains = False
+        return "train" if trains and has_records else "drop"
+
+    @staticmethod
+    async def _report_failure(failure_class: str, action: str, sid: str, step: int, reason: str | None) -> None:
+        log_failure(failure_class, action, sid, step, reason or "")
+        await record_failure(step, failure_class, action)
 
     def _resolve_reward(self, result: dict[str, Any], error: str | None, sid: str) -> float:
         """The rollout's reward_score, which becomes rm_scores directly (verl
@@ -447,4 +543,4 @@ class AgentCoreAgentLoop(AgentLoopBase):
         )
 
 
-__all__ = ["AgentCoreAgentLoop"]
+__all__ = ["AgentCoreAgentLoop", "RolloutDropped"]

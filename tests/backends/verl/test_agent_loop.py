@@ -4,6 +4,8 @@ paths. The loop is constructed through verl's own ``AgentLoopBase`` against a li
 faked."""
 
 import logging
+import re
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +19,12 @@ from agentcore_rl_toolkit.rollout_gateway import TraceRecord
 from .conftest import FakeLLMServerClient, FakeTokenizer, make_data_config, make_trainer_config
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def fast_retries(monkeypatch):
+    """No real backoff sleeps between transient retries."""
+    monkeypatch.setattr(al, "_RETRY_BACKOFF_S", (0.0, 0.0))
 
 
 def _make_loop(llm_client=None, *, use_v1=True, trainer_config=None, **loop_kwargs):
@@ -134,8 +142,9 @@ async def test_malformed_reward_raises():
 
 
 async def test_malformed_reward_on_failed_rollout_still_scores_zero():
-    """A failed rollout with a real partial trace trains that trace at reward 0."""
-    loop = _make_loop()
+    """With drop_agent_errors=False, a failed rollout with a real partial trace
+    trains that trace at reward 0."""
+    loop = _make_loop(drop_agent_errors=False)
     _wire_result(loop, {"status_code": 500, "stop_reason": "boom", "rewards": "invalid"})
     outputs = await loop.run({}, raw_prompt=[{"role": "user", "content": "hi"}], payload={"prompt": "hi"}, uid="u1")
     assert outputs[0].reward_score == 0.0
@@ -207,14 +216,16 @@ async def test_invoke_error_without_trace_raises():
         await loop.run({}, raw_prompt=[{"role": "user", "content": "hi"}], payload={"prompt": "hi"}, uid="u1")
 
 
-async def test_agent_error_status_with_trace_scores_zero():
-    """Agent errored after some LLM turns: trace trains, reward forced to 0.0."""
-    loop = _make_loop()
+async def test_agent_error_status_with_trace_scores_zero_when_not_dropping():
+    """drop_agent_errors=False keeps the old behaviour: the agent errored after some
+    LLM turns, so the trace trains with the reward forced to 0.0."""
+    loop = _make_loop(drop_agent_errors=False)
     _wire_result(loop, {"status_code": 500, "stop_reason": "boom", "rewards": 0.9})
     outputs = await loop.run({}, raw_prompt=[{"role": "user", "content": "hi"}], payload={"prompt": "hi"}, uid="u1")
     assert len(outputs) == 1
     assert outputs[0].reward_score == 0.0  # inline reward ignored on failure
     assert "status_code=500" in outputs[0].extra_fields["acr_error"]
+    assert outputs[0].extra_fields["rollout_failure_class"] == "agent_error"
     assert sum(outputs[0].response_mask) == 2  # partial trace still trains
 
 
@@ -420,3 +431,285 @@ async def test_reward_extra_info_keys_are_stable_across_loop_instances():
         "num_trace_records": 0.0,
     }
     assert set(successful) == set(failed)
+
+
+# -- failure policy -------------------------------------------------------------
+#
+# Each attempt spec drives one invoke: {"invoke_error": exc} raises from invoke_async;
+# otherwise result_async drives "turns" chat turns (or the "messages_per_turn" list of
+# message lists), then raises "poll_error"/"poll_timeout" or returns "result".
+
+_FAILURE_LINE = re.compile(
+    r"^\[rollout-failure\] class=(?P<cls>model|transient|agent_error|timeout) "
+    r"action=(?P<action>train|retry|drop) sid=(?P<sid>[0-9a-f-]{36}) step=(?P<step>\d+) reason=(?P<reason>.*)$"
+)
+_ROW = {"raw_prompt": [{"role": "user", "content": "hi"}], "payload": {"prompt": "hi"}, "uid": "u1", "global_steps": 7}
+
+
+async def _drive(loop, sid: str, message_lists: list[list[dict]]) -> list[int]:
+    statuses = []
+    async with aiohttp.ClientSession() as http:
+        for messages in message_lists:
+            resp = await http.post(
+                f"{loop._gateway.base_url}/v1/chat/completions",
+                json={"model": "m", "messages": messages},
+                headers={"Authorization": f"Bearer {sid}"},
+            )
+            statuses.append(resp.status)
+    return statuses
+
+
+def _wire_attempts(loop, attempts: list[dict]):
+    attempts = list(attempts)
+
+    async def fake_invoke_async(payload, session_id=None, input_id=None, **overrides):
+        spec = attempts.pop(0)
+        fake_invoke_async.calls.append({"session_id": session_id, **overrides})
+        if "invoke_error" in spec:
+            raise spec["invoke_error"]
+        future = MagicMock()
+        future.cancel_async = AsyncMock()
+
+        async def result_async(timeout=None):
+            fake_invoke_async.timeouts.append(timeout)
+            message_lists = spec.get("messages_per_turn")
+            if message_lists is None:
+                message_lists = [[{"role": "user", "content": "hi"}]] * spec.get("turns", 0)
+            fake_invoke_async.statuses.append(await _drive(loop, session_id, message_lists))
+            if "poll_error" in spec:
+                raise spec["poll_error"]
+            if spec.get("poll_timeout"):
+                raise TimeoutError()
+            return spec["result"]
+
+        future.result_async = result_async
+        fake_invoke_async.futures.append(future)
+        return future
+
+    fake_invoke_async.calls = []
+    fake_invoke_async.timeouts = []
+    fake_invoke_async.statuses = []
+    fake_invoke_async.futures = []
+    loop._client.invoke_async = fake_invoke_async
+    return fake_invoke_async
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    """Captures the per-step counts the loop reports to the trainer's stats actor."""
+    events: list[tuple[int, str, str]] = []
+
+    async def record(step, failure_class, action):
+        events.append((step, failure_class, action))
+
+    monkeypatch.setattr(al, "record_failure", record)
+    return events
+
+
+def _failure_lines(caplog) -> list[dict]:
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[rollout-failure]")]
+    parsed = [_FAILURE_LINE.match(line) for line in lines]
+    assert all(parsed), lines  # every line matches the log contract exactly
+    return [m.groupdict() for m in parsed]
+
+
+_OK = {"status_code": 200, "rewards": 1.0}
+# What @rollout_entrypoint saves when the agent's own code raises (e.g. OfficeBench's
+# IndexError on empty content), after the model already took turns.
+_INDEX_ERROR = {"status_code": 500, "stop_reason": "list index out of range", "traceback": "Traceback...\nIndexError"}
+
+
+async def test_context_limit_failure_still_trains_at_reward_zero(caplog, recorded):
+    loop = _make_loop()  # max_context_tokens = response_length = 32
+    first = [{"role": "user", "content": "hi"}]
+    reply = {"role": "assistant", "content": "hello world"}
+    overflow = first + [reply] + [{"role": "user", "content": "more"}] * 15  # 36 prompt tokens >= 32
+    invoke = _wire_attempts(
+        loop,
+        [
+            {
+                "messages_per_turn": [first, overflow],
+                "result": {"status_code": 500, "stop_reason": "ContextWindowOverflow"},
+            }
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        outputs = await loop.run({}, **_ROW)
+
+    assert invoke.statuses[0][0] == 200 and invoke.statuses[0][1] != 200  # the gateway refused the 2nd turn
+    assert len(invoke.calls) == 1
+    assert outputs[0].reward_score == 0.0
+    assert outputs[0].extra_fields["rollout_failure_class"] == "model"
+    assert outputs[0].extra_fields["reward_extra_info"]["acr_failed"] == 1.0
+    [line] = _failure_lines(caplog)
+    assert (line["cls"], line["action"], line["step"]) == ("model", "train", "7")
+    assert recorded == [(7, "model", "train")]
+
+
+async def test_length_finished_last_turn_is_a_model_failure(caplog):
+    from verl.workers.rollout.replica import TokenOutput
+
+    llm = FakeLLMServerClient([TokenOutput(token_ids=[101, 102], log_probs=[-0.5, -0.6], stop_reason="length")])
+    loop = _make_loop(llm)
+    _wire_attempts(loop, [{"turns": 1, "result": {"status_code": 500, "stop_reason": "MaxTokensReached"}}])
+    with caplog.at_level(logging.WARNING):
+        outputs = await loop.run({}, **_ROW)
+    assert outputs[0].reward_score == 0.0
+    assert [(line["cls"], line["action"]) for line in _failure_lines(caplog)] == [("model", "train")]
+
+
+async def test_agent_error_after_model_turns_drops_without_retry(caplog, recorded):
+    loop = _make_loop()
+    invoke = _wire_attempts(loop, [{"turns": 2, "result": _INDEX_ERROR}])
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(al.RolloutDropped) as excinfo:
+            await loop.run({}, **_ROW)
+
+    assert excinfo.value.failure_class == "agent_error"
+    assert isinstance(excinfo.value, RuntimeError)  # verl drops just this trajectory
+    assert len(invoke.calls) == 1
+    [line] = _failure_lines(caplog)
+    assert (line["cls"], line["action"]) == ("agent_error", "drop")
+    assert line["sid"] == invoke.calls[0]["session_id"]
+    assert "\n" not in line["reason"] and line["reason"].startswith("agent returned status_code=500")
+    assert recorded == [(7, "agent_error", "drop")]
+    assert loop._gateway.gateway.manager.turn_count(line["sid"]) == 0  # session drained
+
+
+async def test_invoke_error_retries_once_on_a_fresh_session_then_succeeds(caplog, recorded):
+    loop = _make_loop()
+    invoke = _wire_attempts(loop, [{"invoke_error": RuntimeError("ThrottlingException")}, {"turns": 1, "result": _OK}])
+    with caplog.at_level(logging.WARNING):
+        outputs = await loop.run({}, **_ROW)
+
+    first_sid, second_sid = (c["session_id"] for c in invoke.calls)
+    assert first_sid != second_sid
+    assert invoke.calls[1]["api_key"] == second_sid
+    assert outputs[0].reward_score == 1.0
+    assert outputs[0].extra_fields["acr_session_id"] == second_sid
+    assert outputs[0].extra_fields["rollout_attempts"] == 2
+    assert "rollout_failure_class" not in outputs[0].extra_fields
+    [line] = _failure_lines(caplog)
+    assert (line["cls"], line["action"], line["sid"]) == ("transient", "retry", first_sid)
+    assert recorded == [(7, "transient", "retry")]
+    # the first session is gone from every adapter
+    assert all(first_sid not in a.store for a in loop._gateway.gateway.adapters)
+
+
+async def test_status_500_without_model_turns_is_transient():
+    loop = _make_loop()
+    invoke = _wire_attempts(
+        loop, [{"turns": 0, "result": {"status_code": 500, "stop_reason": "cold start"}}, {"turns": 1, "result": _OK}]
+    )
+    outputs = await loop.run({}, **_ROW)
+    assert len(invoke.calls) == 2
+    assert outputs[0].reward_score == 1.0
+
+
+async def test_poll_error_retries_and_cancels_the_old_session():
+    loop = _make_loop()
+    invoke = _wire_attempts(loop, [{"turns": 1, "poll_error": RuntimeError("S3 503")}, {"turns": 1, "result": _OK}])
+    outputs = await loop.run({}, **_ROW)
+    assert len(invoke.calls) == 2
+    invoke.futures[0].cancel_async.assert_awaited_once()
+    assert outputs[0].extra_fields["rollout_attempts"] == 2
+    assert sum(outputs[0].response_mask) == 2  # only the retried session's turn trains
+
+
+async def test_transient_failure_drops_once_retries_are_exhausted(caplog, recorded):
+    loop = _make_loop(max_rollout_retries=1)
+    invoke = _wire_attempts(loop, [{"invoke_error": RuntimeError("boom 1")}, {"invoke_error": RuntimeError("boom 2")}])
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(al.RolloutDropped, match="boom 2") as excinfo:
+            await loop.run({}, **_ROW)
+    assert excinfo.value.failure_class == "transient"
+    assert len(invoke.calls) == 2
+    assert [(line["cls"], line["action"]) for line in _failure_lines(caplog)] == [
+        ("transient", "retry"),
+        ("transient", "drop"),
+    ]
+    assert recorded == [(7, "transient", "retry"), (7, "transient", "drop")]
+
+
+async def test_zero_retries_drops_transient_immediately():
+    loop = _make_loop(max_rollout_retries=0)
+    invoke = _wire_attempts(loop, [{"invoke_error": RuntimeError("boom")}])
+    with pytest.raises(al.RolloutDropped):
+        await loop.run({}, **_ROW)
+    assert len(invoke.calls) == 1
+
+
+async def test_retries_share_one_max_rollout_time_deadline():
+    loop = _make_loop(max_rollout_time=30.0)
+    invoke = _wire_attempts(loop, [{"invoke_error": RuntimeError("boom")}, {"turns": 1, "result": _OK}])
+    # start, the retry's deadline check, the second attempt's remaining-time check, ...
+    clock = iter([100.0, 104.0, 112.0])
+    # Replace only agent_loop's clock: the event loop and aiohttp keep the real one.
+    with patch.object(al, "time", SimpleNamespace(monotonic=lambda: next(clock, 113.0))):
+        await loop.run({}, **_ROW)
+    # The retry polls only for what is left of the shared 30 s budget.
+    assert invoke.timeouts == [pytest.approx(18.0)]
+
+
+async def test_no_retry_when_the_backoff_would_overrun_the_deadline(monkeypatch, caplog):
+    monkeypatch.setattr(al, "_RETRY_BACKOFF_S", (5.0, 5.0))
+    loop = _make_loop(max_rollout_time=1.0)
+    invoke = _wire_attempts(loop, [{"invoke_error": RuntimeError("boom")}])
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(al.RolloutDropped, match="no time left"):
+            await loop.run({}, **_ROW)
+    assert len(invoke.calls) == 1
+    assert [(line["cls"], line["action"]) for line in _failure_lines(caplog)] == [("transient", "drop")]
+
+
+async def test_timeout_drops_by_default_even_with_captured_turns(caplog):
+    loop = _make_loop()
+    invoke = _wire_attempts(loop, [{"turns": 2, "poll_timeout": True}])
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(al.RolloutDropped, match="timed out") as excinfo:
+            await loop.run({}, **_ROW)
+    assert excinfo.value.failure_class == "timeout"
+    assert len(invoke.calls) == 1  # timeouts are never retried
+    assert [(line["cls"], line["action"]) for line in _failure_lines(caplog)] == [("timeout", "drop")]
+
+
+async def test_timeout_policy_penalize_trains_at_reward_zero(caplog):
+    loop = _make_loop(timeout_policy="penalize")
+    _wire_attempts(loop, [{"turns": 2, "poll_timeout": True}])
+    with caplog.at_level(logging.WARNING):
+        outputs = await loop.run({}, **_ROW)
+    assert outputs[0].reward_score == 0.0
+    assert outputs[0].extra_fields["rollout_failure_class"] == "model"
+    assert [(line["cls"], line["action"]) for line in _failure_lines(caplog)] == [("model", "train")]
+
+
+async def test_model_failure_without_tokens_is_dropped():
+    loop = _make_loop(timeout_policy="penalize")
+    _wire_attempts(loop, [{"turns": 0, "poll_timeout": True}])
+    with pytest.raises(al.RolloutDropped) as excinfo:
+        await loop.run({}, **_ROW)
+    assert excinfo.value.failure_class == "model"
+
+
+async def test_failure_reason_is_single_line_and_truncated(caplog):
+    loop = _make_loop()
+    _wire_attempts(loop, [{"turns": 1, "result": {"status_code": 500, "stop_reason": "line1\nline2\r\n" + "x" * 500}}])
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(al.RolloutDropped):
+            await loop.run({}, **_ROW)
+    [line] = _failure_lines(caplog)
+    assert len(line["reason"]) == 200
+    assert "line1 line2 " in line["reason"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"timeout_policy": "retry"}, "timeout_policy"),
+        ({"max_rollout_retries": -1}, "max_rollout_retries"),
+        ({"max_rollout_retries": True}, "max_rollout_retries"),
+    ],
+)
+async def test_invalid_failure_policy_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_loop(**kwargs)

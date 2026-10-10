@@ -249,6 +249,7 @@ class TrajectoryManager:
     def __init__(self) -> None:
         self._trees: dict[str, MessageNode] = {}
         self._turn_count: dict[str, int] = {}
+        self._last_finish_reason: dict[str, str] = {}
 
     # -------------------- public ------------------------------------------
 
@@ -257,6 +258,12 @@ class TrajectoryManager:
 
     def turn_count(self, sid: str) -> int:
         return self._turn_count.get(sid, 0)
+
+    def last_finish_reason(self, sid: str) -> str | None:
+        """The engine finish reason of the sid's most recently recorded turn
+        (e.g. ``"length"``), or ``None`` if no turn was recorded. Consumed with
+        the session, so read it before ``get_trajectory``/``drop_session``."""
+        return self._last_finish_reason.get(sid)
 
     def record_turn(
         self,
@@ -318,11 +325,13 @@ class TrajectoryManager:
 
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
+        self._last_finish_reason.pop(sid, None)
         return samples
 
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
+        self._last_finish_reason.pop(sid, None)
 
     # -------------------- internals ----------------------------------------
 
@@ -371,6 +380,7 @@ class TrajectoryManager:
         asst.turn_index = self._turn_count.get(sid, 0) + 1
         node.add_child(asst)
         self._turn_count[sid] = asst.turn_index
+        self._last_finish_reason[sid] = turn.finish_reason
 
     def _split_chain_into_builders(self, chain: list[MessageNode]) -> list[_SampleBuilder]:
         """Pack the chain's generated turns into per-sample token builders.

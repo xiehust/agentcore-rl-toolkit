@@ -183,6 +183,36 @@ def test_truncated_metadata_from_length_finish():
     assert r.metadata["truncated"] is True
 
 
+def test_last_finish_reason_tracks_the_latest_turn_until_consumed():
+    mgr = TrajectoryManager()
+    assert mgr.last_finish_reason("s") is None
+    mgr.record_turn(
+        "s",
+        turn=TurnRecord(prompt_ids=[1], output_ids=[2, 3], finish_reason="length"),
+        prompt_messages=[_um("hi")],
+        response_message=_am("a"),
+    )
+    assert mgr.last_finish_reason("s") == "length"
+    mgr.record_turn(
+        "s",
+        turn=TurnRecord(prompt_ids=[1, 2, 3, 4], output_ids=[5], finish_reason="stop"),
+        prompt_messages=[_um("hi"), _am("a"), _um("more")],
+        response_message=_am("b"),
+    )
+    assert mgr.last_finish_reason("s") == "stop"
+    mgr.get_trajectory("s", base_sample=BaseTrace(index=0))
+    assert mgr.last_finish_reason("s") is None
+
+    mgr.record_turn(
+        "t",
+        turn=TurnRecord(prompt_ids=[1], output_ids=[2], finish_reason="length"),
+        prompt_messages=[_um("hi")],
+        response_message=_am("a"),
+    )
+    mgr.drop_session("t")
+    assert mgr.last_finish_reason("t") is None
+
+
 def test_get_trajectory_consumes_session():
     mgr = TrajectoryManager()
     mgr.record_turn(
