@@ -80,32 +80,12 @@ a2a = [
     "agentcore-rl-toolkit[a2a-server]",
     "agentcore-rl-toolkit[rollout]",
 ]
-slime = [
-    # Proxy that sits between the agent and SGLang during training, capturing
-    # token IDs and logprobs into TraceRecords that slime consumes as Samples.
-    # Required by agentcore_rl_toolkit.backends.slime.{gateway,rollout,traces}.
-    "rllm-model-gateway>=0.1.0",
-]
-rllm = [
-    # rllm training framework. Not on PyPI — installed from GitHub.
-    # rllm pulls in rllm-model-gateway transitively for trajectory capture.
-    # Users still need to install a training backend (verl or Tinker)
-    # separately per rllm's instructions.
-    #
-    # NOTE: do not depend on rllm's own [agentcore] extra here — it pulls
-    # in agentcore-rl-toolkit, which would create a circular dependency.
-    #
-    # The git source is declared in [tool.uv.sources] below rather than inline
-    # here, because PyPI rejects direct-reference (git URL) dependencies in
-    # uploaded packages. uv reads the source when installing from the repo.
-    "rllm",
-]
 verl = [
     # For backends/verl — see its README for design and install notes.
     "verl==0.9.0",
     # verl 0.9.0 declares its core dependencies, but still omits these dependencies
     # required at import time on our training path:
-    "transferqueue==0.1.8",  # required by the v1 trainer
+    "transferqueue==0.1.10",  # required by the v1 trainer
     "orjson",  # required for tracking
     "aiohttp>=3.9",
     # The gateway's schema derender needs tokenizer.parse_response (transformers >=5.0).
@@ -125,6 +105,13 @@ verl = [
     "qwen-vl-utils",
 ]
 [dependency-groups]
+sagemaker-integration = [
+    "sagemaker-train>=1.13.0",
+    "httpx>=0.27.0",
+    "openai>=1.0",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
 swe-agent = [
     "datasets",
     "polars>=1.41.2",
@@ -135,7 +122,7 @@ verl-ci = [
     # CI uses CPU torch and omits inference-only dependencies because the
     # integration tests fake the LLM-server seam.
     "verl==0.9.0",
-    "transferqueue==0.1.8",
+    "transferqueue==0.1.10",
     "orjson",
     # verl deps the full extra gets transitively via vllm: fastapi/uvicorn are
     # in verl's requirements.txt (not its setup.py); cachetools is undeclared
@@ -175,12 +162,10 @@ conflicts = [
     ],
     [
         { extra = "verl" },
-        { extra = "rllm" },
         { group = "verl-ci" },
     ],
     # Installed alongside verl, so it needs a separate conflict group.
     [
-        { extra = "rllm" },
         { group = "verl-ci" },
         { group = "verl-megatron" },
     ],
@@ -206,12 +191,6 @@ version = "0.5.0"
 requires-dist = []
 
 [tool.uv.sources]
-# rllm is not published to PyPI; install it from GitHub. The git source is
-# declared here rather than inline in [project.optional-dependencies] so the
-# published package metadata stays free of direct-reference (git URL)
-# dependencies, which PyPI rejects. uv reads this source when installing the
-# [rllm] extra from a checkout of this repo.
-rllm = { git = "https://github.com/rllm-org/rllm.git" }
 # CI group only: CPU torch wheels so the CUDA distribution (plus nvidia-* wheels)
 # never resolves on GitHub runners. The other extras keep the default index.
 torch = [
@@ -242,11 +221,6 @@ name = "verl-wheelhouse"
 url = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.11/simple/"
 explicit = true
 
-
-[tool.hatch.metadata]
-# Required so the [rllm] optional extra can pin rllm via a git URL
-# (PEP 508 direct reference). Hatchling rejects these by default.
-allow-direct-references = true
 
 [tool.hatch.build.targets.sdist]
 include = ["src/"]
