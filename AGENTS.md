@@ -34,7 +34,7 @@ cd examples/strands_math_agent && uv sync && uv run python rl_app.py
 | `src/agentcore_rl_toolkit/rollout_gateway/` | In-repo token-level trajectory capture layer: `RolloutGateway`, `Renderer`, `SamplingBackend`, `TraceRecord` (see [Rollout Gateway](#rollout-gateway)) |
 | `src/agentcore_rl_toolkit/backends/verl/` | verl backend: `AgentCoreAgentLoop` plugged into verl's standard main_ppo entrypoint via the rollout gateway |
 | `src/agentcore_rl_toolkit/backends/tinker_api/` | CPU training loop over a Tinker-compatible endpoint, with HF rendering and synchronous group-relative updates |
-| `src/agentcore_rl_toolkit/backends/experimental/slime/` | Experimental slime backend: `generate` + `normalize_episode_rewards` hooks for slime's `--custom-generate-function-path` / `--custom-reward-post-process-path` (see [Experimental slime backend](#experimental-slime-backend-backendsexperimentalslime)) |
+| `src/agentcore_rl_toolkit/backends/slime/` | slime backend: `generate` + `normalize_episode_rewards` hooks for slime's `--custom-generate-function-path` / `--custom-reward-post-process-path` (see [slime backend](#slime-backend-backendsslime)) |
 | `src/agentcore_rl_toolkit/sandbox/` | Sandbox SDK: `SandboxClient`, `Sandbox`, `ExecResult` — run programs in arbitrary images on ACR (see [Sandbox SDK](#sandbox-sdk)) |
 | `sandboxd/` | Go daemon (`agentcore-sandboxd`) for session health and recoverable command execution |
 | `examples/strands_math_agent/` | GSM8K math agent example |
@@ -102,6 +102,11 @@ On the client side, `RolloutClient` and `RolloutFuture` are the complement to th
 
 **AgentCoreRuntimeApp** (`src/agentcore_rl_toolkit/runtime/`)
 - Exported from `agentcore_rl_toolkit`; retains `@app.entrypoint` and ordinary HTTP behavior.
+- `background=True` runs requests without `_agentcore_runtime` in the background
+  with generated invocation IDs; ordinary retries may execute again. Explicit
+  envelopes retain their protocol behavior. See the
+  [SageMaker RFT example](designs/agentcore_runtime_app.md#sagemaker-rft-example)
+  and [integration tests](tests/runtime/test_sagemaker_rft.py).
 - Requests with `_agentcore_runtime` use versioned `start/get`, foreground/background execution, and session-scoped invocation IDs.
 - Records live under configurable `state_dir`, defaulting to `.agentcore_runtime` under the OS temporary directory (`TMPDIR`).
 - One app process serves one Runtime session; live tasks are keyed by invocation ID. Filesystem records retain session-specific paths; use a managed mount for stop/resume persistence.
@@ -133,8 +138,7 @@ On the client side, `RolloutClient` and `RolloutFuture` are the complement to th
 
 `src/agentcore_rl_toolkit/rollout_gateway/` is an in-repo, backend-agnostic layer that
 captures **token-level, loss-maskable trajectories** from agent rollouts for RL training.
-It is the successor to the `rllm-model-gateway` dependency used by the current
-`backends/{slime,verl}` integrations.
+It is used by the toolkit's `backends/{slime,verl,tinker_api}` integrations.
 
 **Why it exists.** RL training needs per-token ids, logprobs, and a loss mask for every
 model turn — not just the final text. The gateway captures these transparently: an agent
@@ -201,13 +205,8 @@ behaviour unchanged.
   would silently miss every other; opt into it explicitly with
   `tool_parser=parse_tool_uses`); the gateway itself never imports an inference
   engine. Injecting a `reasoning_parser` / `tool_parser` callable into
-  `HfTemplateRenderer` disables schema detection and takes full control. The slime backend injects parsers built from
-  SGLang's own detectors (`backends/slime/integration/sglang_parsing.py`, composing
-  `FunctionCallParser` + `ReasoningParser`) wired from slime's
-  `--sglang-tool-call-parser` / `--sglang-reasoning-parser` args (names must match the
-  served model); sglang is always importable there because the trainer serves SGLang.
-  The experimental slime backend (`backends/experimental/slime/`) instead uses the default
-  schema-based parsing (`HfTemplateRenderer` with no custom parsers); injecting the same
+  `HfTemplateRenderer` disables schema detection and takes full control. The slime
+  backend (`backends/slime/`) uses the default schema-based parsing (`HfTemplateRenderer` with no custom parsers); injecting the same
   SGLang-native parsers via the `reasoning_parser` / `tool_parser` kwargs is a natural
   extension if tool-bearing or reasoning-bearing models are served.
 - For Tinker API training (`backends/tinker_api/`), install `[gateway,tinker_api]`
@@ -223,10 +222,17 @@ importing the package never requires aiohttp. Tests live in `tests/rollout_gatew
 
 **Status.** The capture layer above is implemented and tested. Training-backend consumers:
 the **verl backend** (`backends/verl/`, see below), the **Tinker API backend**
-(`backends/tinker_api/`), and the **experimental slime backend**
-(`backends/experimental/slime/`, see below). Other
+(`backends/tinker_api/`), and the **slime backend**
+(`backends/slime/`, see below). Other
 backends' dispatch/reward-join glue is not yet on the main branch — a prototype
 dispatcher is parked on the `wip/online-rl-dispatch` branch.
+
+### External Integrations
+
+[rLLM natively integrates with AgentCore Runtime](https://docs.rllm-project.com/agent-runtimes/agentcore).
+rLLM maintains its installation, configuration, training, and troubleshooting
+instructions upstream. This repository provides agent adaptation and deployment
+guides; its training integrations and rollout gateway are maintained separately.
 
 ### verl backend (`backends/verl/`)
 
@@ -246,13 +252,13 @@ sha256 hashes of the covered chat templates — preserving the marked local-addi
 block at the end of `_TEMPLATE_HASHES` (templates with no TRL equivalent, e.g.
 Qwen3-Coder → `qwen3_5`). Bump the baseline commit here when you re-sync.
 
-### Experimental slime backend (`backends/experimental/slime/`)
+### slime backend (`backends/slime/`)
 
 Plugs into [slime](https://github.com/THUDM/slime) (Megatron-LM + SGLang GRPO trainer)
 via two hook entry points, requiring no changes to slime itself:
 
-- `--custom-generate-function-path agentcore_rl_toolkit.backends.experimental.slime.integration.rollout.generate`
-- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.experimental.slime.integration.rewards.normalize_episode_rewards`
+- `--custom-generate-function-path agentcore_rl_toolkit.backends.slime.integration.rollout.generate`
+- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.slime.integration.rewards.normalize_episode_rewards`
 - `--custom-config-path /path/to/config.yaml` (see `examples/math_agent/config.yaml.example`)
 
 **Key pieces:**
@@ -285,7 +291,7 @@ for the positional advantage estimator; the actual agent input lives in `metadat
 **Installation.**
 
 ```bash
-bash src/agentcore_rl_toolkit/backends/experimental/slime/scripts/install_slime.sh
+bash src/agentcore_rl_toolkit/backends/slime/scripts/install_slime.sh
 ```
 
 Requires CUDA 13 (`CUDA_HOME=/usr/local/cuda-13.0`). The script installs: cu13 PyTorch +
@@ -295,7 +301,7 @@ nvidia-modelopt, sglang, and clones + installs slime + Megatron-LM from source.
 **Running (GSM8K example).**
 
 ```bash
-cd src/agentcore_rl_toolkit/backends/experimental/slime/examples/math_agent
+cd src/agentcore_rl_toolkit/backends/slime/examples/math_agent
 cp config.yaml.example config.yaml  # fill in agent_runtime_arn + s3_bucket
 SLIME_DIR=... MODEL_DIR=... TRAIN_DATA_PATH=... MODEL_TYPE=... bash train.sh
 ```
@@ -566,7 +572,7 @@ uv pip install -e ../../ --force-reinstall --no-deps
 - GitHub pull request descriptions must not hard-wrap prose at a fixed column width. Write each Markdown paragraph as one physical line, regardless of length, and let GitHub handle visual wrapping.
 - In pull request descriptions, insert newlines only for Markdown structure: paragraph boundaries, headings, list items, blockquotes, tables, code blocks, and similar constructs.
 - This pull request formatting rule does not apply to git commit messages or repository documentation; follow their existing wrapping conventions.
-- When implementing or changing behavior covered by a document in `designs/`, update that document and its `Implementation` status in the same change.
+- When implementing or changing behavior covered by a document in `designs/`, update the relevant design content in the same change. Do not change its `Implementation` status unless explicitly requested.
 - Return a JSON-serializable dict from `@rollout_entrypoint` (any structure accepted — no required keys)
 - Create model and agent inside the entrypoint function (not at module level) so config comes from the `_rollout` payload
 - Use standard `OpenAIModel` for OpenAI-compatible inference endpoints (token capture during training is handled at the infrastructure layer)
@@ -599,6 +605,3 @@ uv pip install -e ../../ --force-reinstall --no-deps
 - **bedrock-agentcore-starter-toolkit** (CLI tools, Dockerfile generation): https://github.com/aws/bedrock-agentcore-starter-toolkit
 - **Runtime SDK Overview**: https://aws.github.io/bedrock-agentcore-starter-toolkit/user-guide/runtime/overview.html
 - **HTTP Protocol Contract**: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html#container-requirements-http
-- **rLLM SDK (reference)**: https://rllm-project.readthedocs.io/en/latest/core-concepts/sdk/#1-define-your-agent-function
-- **rllm-model-gateway** (token capture proxy for RL training): https://github.com/rllm-org/rllm/tree/main/rllm-model-gateway | [PyPI](https://pypi.org/project/rllm-model-gateway/)
-- **AgentCore math training example** (rllm + Tinker backend): https://github.com/rllm-org/rllm/blob/main/examples/agentcore_math/train_agentcore_math_tinker.sh

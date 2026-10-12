@@ -42,11 +42,22 @@ export default defineConfig({
 					items: [
 						{ label: 'Prepare agent for RL', slug: 'guides/agent-adaptation' },
 						{
-							label: 'Training backends',
+							label: 'Training Backends',
 							items: [
-								{ label: 'slime', slug: 'guides/slime-backend-setup' },
-								{ label: 'rllm', slug: 'guides/rllm-backend-setup' },
 								{ label: 'verl', slug: 'guides/verl-backend-setup' },
+								{ label: 'slime', slug: 'guides/slime-backend-setup' },
+								{
+									label: 'SkyRL ↗',
+									link: 'https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md',
+								},
+								{
+									label: 'Tinker ↗',
+									link: 'https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md',
+								},
+								{
+									label: 'rLLM ↗',
+									link: 'https://docs.rllm-project.com/agent-runtimes/agentcore',
+								},
 							],
 						},
 					],
@@ -91,22 +102,13 @@ export default defineConfig({
 							label: 'Core',
 							items: [{ autogenerate: { directory: 'api/core' } }],
 						},
-						{
-							label: 'Backends',
-							items: [
-								{
-									label: 'slime',
-									items: [{ autogenerate: { directory: 'api/backends/slime' } }],
-								},
-							],
-						},
 					],
 				},
 				{
 					label: 'Troubleshooting',
 					items: [
 						{
-							label: 'Training backends',
+							label: 'Training Backends',
 							items: [
 								{ label: 'slime', slug: 'troubleshooting/slime' },
 							],
