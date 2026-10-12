@@ -147,7 +147,7 @@
       </div>
       <div class="callout"><strong>最重要的理解：</strong>Agent 的最终 JSON 结果与模型的 token 轨迹走不同通道。前者回答“任务做得怎样”，后者回答“模型究竟生成了什么”。训练端把它们按 episode / session 关联，才形成训练样本。</div>
       <p>只做评估时，可以直接使用 <code>RolloutClient</code> 收集业务结果，不必经过网关或训练引擎。网关的 <code>TraceRecord</code> 和轨迹核心不依赖 torch；推理和优化器由后端承担。Sandbox SDK 是独立的程序执行能力，也不是每次 rollout 的必经模块。</p>
-      <p class="source">入口：<a href="../README.md">README</a><a href="../src/agentcore_rl_toolkit/__init__.py">公开 API</a><a href="../pyproject.toml">依赖与 extras</a></p>
+      <p class="source">入口：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/README.md">README</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/__init__.py">公开 API</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/pyproject.toml">依赖与 extras</a></p>
     </section>
 
     <section id="architecture">
@@ -168,7 +168,7 @@
       </tbody></table></div>
       <h3>运行时依赖也遵循这个边界</h3>
       <p>基础安装保留 AgentCore、boto3 等 Agent 侧能力；<code>[gateway]</code> 添加 aiohttp / transformers / jmespath；训练 SDK 与 GPU 栈按各后端额外安装。不要因为训练需要 GPU，就把完整训练环境塞进每个 Agent 镜像。</p>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/rollout_gateway/gateway.py">RolloutGateway</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/server.py">ThreadedGatewayServer</a><a href="../src/agentcore_rl_toolkit/rollout_session/factory.py">Session factory</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/gateway.py">RolloutGateway</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/server.py">ThreadedGatewayServer</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_session/factory.py">Session factory</a></p>
     </section>
     <section id="execution">
       <div class="section-top"><span class="number">03</span><h2>S3 路径：把长任务拆成提交与回收</h2></div>
@@ -195,7 +195,7 @@
       <div class="callout warn"><strong>确定性结果键不等于幂等执行。</strong>重复提交同一 session 的 S3 rollout 仍会创建新后台任务；结果可能覆盖同一个对象，也可能读取旧对象。不要把这条路径当成 exactly-once 队列。S3 写入及错误结果写入都失败时，客户端只能继续等待或超时。</div>
       <h3>同步、异步与批量接口怎么选</h3>
       <p><code>future.result(timeout=…)</code> 适合同步代码；<code>await future.result_async(timeout=…)</code> 适合异步编排。<code>run_batch / run_batch_async</code> 额外管理在途会话并发和结果聚合。这里的“invoke 立即返回”是<strong>无需等待整个 Agent 任务</strong>，不是没有网络提交与冷启动等待。</p>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/app.py">app.py · rollout_entrypoint / save_result</a><a href="../src/agentcore_rl_toolkit/client.py">client.py · invoke / result / run_batch</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/app.py">app.py · rollout_entrypoint / save_result</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/client.py">client.py · invoke / result / run_batch</a></p>
     </section>
 
     <section id="http">
@@ -229,7 +229,7 @@
         <article class="card"><span class="tag">A2A</span><h3>两阶段任务协议</h3><p>首条 message 创建 task 并 setup，等到 <code>input-required</code>；第二条 message 驱动 rollout，再从名为 <code>rollout</code> 的 artifact 读取 dump。AgentCore 与 Docker 各有自己的环境启动和清理实现。</p></article>
       </div>
       <div class="callout"><strong>实现边界：</strong><code>make_session()</code> 当前只接受 <code>agentcore_a2a、docker_a2a、agentcore_s3</code>。HTTP Session 已实现，但由 Tinker 直接构造，不在这个 factory 分支中。A2A 的 task/message ID 也不能套用 HTTP invocation 的持久去重保证。</div>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/runtime/app.py">Runtime app</a><a href="../src/agentcore_rl_toolkit/runtime/client.py">HTTP client</a><a href="../src/agentcore_rl_toolkit/runtime/store.py">记录存储</a><a href="../src/agentcore_rl_toolkit/rollout_session/lifecycle.py">生命周期</a><a href="../src/agentcore_rl_toolkit/rollout_session/a2a_client.py">A2A client</a><a href="../designs/runtime_invocation_protocol.md">协议设计</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/app.py">Runtime app</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/client.py">HTTP client</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/store.py">记录存储</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_session/lifecycle.py">生命周期</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_session/a2a_client.py">A2A client</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/designs/runtime_invocation_protocol.md">协议设计</a></p>
     </section>
     <section id="gateway">
       <div class="section-top"><span class="number">05</span><h2>模型网关：在采样现场拿到真实 token</h2></div>
@@ -258,7 +258,7 @@
         <li>公共 adapter 链路不是完整多模态实现；后端接口预留 image/video 参数，不代表上游已经贯通。</li>
         <li>轨迹状态在网关内存中。S3 已有业务结果并不意味着网关重启后还能恢复丢失的 token 轨迹。</li>
       </ul>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">公共请求链路</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/render.py">HF renderer</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/response_schemas.py">schema 注册表</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/base.py">SamplingBackend 协议</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">公共请求链路</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/render.py">HF renderer</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/response_schemas.py">schema 注册表</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/base.py">SamplingBackend 协议</a></p>
     </section>
 
     <section id="trajectory">
@@ -292,7 +292,7 @@ system → user → assistant A ─┬→ tool X → assistant B   trace 1
       <p><code>LinearHealer</code> 记住实际喂给模型的 prompt 与实际生成输出，下一轮复用这一 canonical token 前缀，补上 assistant closer 和新增观察。底层仍使用同一个 TrajectoryManager；修复的是<strong>下一次采样的输入</strong>，不是伪造历史 logprob。</p>
       <p>它适合消息只追加、tools schema 不变的串行 Agent。遇到编辑、压缩、分叉或 tools 变化时，有 <code>reset / error / passthrough</code> 三种策略。默认 reset 会重新锚定新线性段，仍可能导出多行；同 sid 的并行子 Agent 不应共享这份线性状态。</p>
       <div class="callout"><strong>三个身份需要上层接好：</strong>sid 管网关会话，<code>rollout_id</code> 管同一 episode 的多条记录，group 管同题多次采样。TraceRecord 不会自动把 sid 当成 rollout_id。跨 sid 的子 Agent 归组需要编排层显式关联。</div>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/rollout_gateway/trace.py">TraceRecord</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/trajectory.py">消息树与导出</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/linear.py">LinearHealer</a><a href="../designs/gateway_linear.md">linear 设计</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/trace.py">TraceRecord</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/trajectory.py">消息树与导出</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/linear.py">LinearHealer</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/designs/gateway_linear.md">linear 设计</a></p>
     </section>
     <section id="training">
       <div class="section-top"><span class="number">07</span><h2>训练后端：相同目标，不同接线方式</h2></div>
@@ -345,7 +345,7 @@ verl 推理服务
         <tr><td>experimental/slime</td><td><code>TraceRecord → Sample.tokens</code>，连同 mask / logprob，由 <code>generate</code> hook 返回给 slime。</td></tr>
       </tbody></table></div>
       <p>关联的前提是：训练端先注册 sid，再把它作为 api-key 传给 Agent 的模型客户端。若 Agent 绕过网关直接请求模型，或使用错误的 sid，业务结果可能正常返回，但对应会话未必有可训练轨迹。网关内存丢失也不能仅靠 S3 业务结果重建原始采样 token 与 logprob。</p>
-      <p class="source">仓内源码：<a href="../src/agentcore_rl_toolkit/backends/verl/gateway_host.py">worker 进程内网关</a><a href="../src/agentcore_rl_toolkit/backends/verl/sampling_backend.py">推理 token 返回</a><a href="../src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">record_turn</a><a href="../src/agentcore_rl_toolkit/backends/verl/agent_loop.py">finish_session / _record_to_output</a>。队列后处理位于已安装的 verl 依赖 <code>verl/trainer/ppo/v1/agent_loop_tq.py</code>，不是本仓库另行实现的 token 上传服务。</p>
+      <p class="source">仓内源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/gateway_host.py">worker 进程内网关</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/sampling_backend.py">推理 token 返回</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">record_turn</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/agent_loop.py">finish_session / _record_to_output</a>。队列后处理位于已安装的 verl 依赖 <code>verl/trainer/ppo/v1/agent_loop_tq.py</code>，不是本仓库另行实现的 token 上传服务。</p>
       <h3>7.1 verl：保留完整轨迹，同时稳定优化步数</h3>
       <p><code>PayloadDataset</code> 保留真实任务 payload，并适配 verl 所需的 prompt 结构。<code>AgentCoreAgentLoop</code> 为每次尝试创建 session，将同一 ID 用作 Runtime session 与网关 api-key。Agent 通过网关调用训练集群的采样副本；S3 结果到达后，每条 TraceRecord 转成 <code>AgentLoopOutput</code>。</p>
       <p>奖励由 Agent 提供，转成 <code>reward_score / rm_scores</code>。可训练 token 最多的一行被放到该 session 的末尾，以配合 verl v1 的 session 级组相对优势计算与广播。随后 old/ref logprob、配置的 rollout correction、actor 更新及权重同步由 verl 执行；这里不是重复实现一套训练器。</p>
@@ -353,7 +353,7 @@ verl 推理服务
       <div class="formula">K = train_batch_size / parameter_sync_step / ppo_mini_batch_size<br>补齐行数：只需满足 DP × K 的整除条件。<br>归一化尺度：保留配置的 ppo_mini_batch_size × rollout.n。</div>
       <p>这一实现要求 verl v1、actor-only、无蒸馏以及 <code>seq-mean-token-sum</code>。它稳定优化步数和预设归一化尺度，但<strong>不等于每个长短不同的 episode 都有等量 token 损失权重</strong>。初始 prompt 超出存储分区时，溢出部分移到 response 区并置 mask=0，而不是简单丢弃。</p>
       <p>失败处理区分模型上下文耗尽、普通 Agent 错误、瞬时基础设施异常和超时。瞬时错误可在共享总期限内换新 session 重试；有轨迹的模型限制失败可零奖训练。普通 Agent 错误和超时默认丢弃，部分策略可配置；同步 trainer 还有连续高丢弃率保护。</p>
-      <p class="source">源码与契约：<a href="../src/agentcore_rl_toolkit/backends/verl/agent_loop.py">AgentCoreAgentLoop</a><a href="../src/agentcore_rl_toolkit/backends/verl/trainer_mixins/variable_row_batching.py">可变行 batching</a><a href="../src/agentcore_rl_toolkit/backends/verl/README.md">verl README</a><a href="../designs/verl_variable_trajectory_batching.md">batching 推导</a></p>
+      <p class="source">源码与契约：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/agent_loop.py">AgentCoreAgentLoop</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/trainer_mixins/variable_row_batching.py">可变行 batching</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/README.md">verl README</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/designs/verl_variable_trajectory_batching.md">batching 推导</a></p>
       <h3>7.2 Tinker API：CPU 编排、同步组相对更新</h3>
       <ol class="steps">
         <li><strong>每题采一组 episode。</strong><p>读取平铺 JSONL 任务，注入 <code>_config={base_url, model_id, api_key}</code>，用 HTTP Session 后台执行。Agent 返回单数 reward；成功响应要求有限数值，拒绝 bool、字符串和缺失值。</p></li>
@@ -362,14 +362,14 @@ verl 推理服务
         <li><strong>完整收批后更新，再切换采样模型。</strong><p>调用 <code>forward_backward_async(loss_fn="importance_sampling")</code> 和 Adam 更新，消费结果后保存权重并替换 sampling client，下一批才开始。这条 recipe 没有实现 clipped PPO 或显式 KL 项。</p></li>
       </ol>
       <p>调用失败但已有可训练 token 时可零奖保留；无 token 的 episode 不计入奖励统计。验证在训练前、按间隔及结束时运行，每题单次采样，不构建训练 datum，增量写 JSONL 并报告覆盖、失败和截断情况。当前入口可保存 checkpoint，但未提供恢复训练参数。</p>
-      <p class="source">源码与配方：<a href="../src/agentcore_rl_toolkit/backends/tinker_api/train.py">同步训练 loop</a><a href="../src/agentcore_rl_toolkit/backends/tinker_api/data.py">优势与 Datum</a><a href="../src/agentcore_rl_toolkit/backends/tinker_api/README.md">Tinker README</a></p>
+      <p class="source">源码与配方：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/train.py">同步训练 loop</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/data.py">优势与 Datum</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md">Tinker README</a></p>
       <h3>7.3 两条 slime 路径必须分开看</h3>
       <div class="grid two">
         <article class="card"><span class="tag green">experimental/slime</span><h3>逐样本生成 hook</h3><p>进程单例维护仓内 RolloutGateway、后台线程与 RolloutClient。一次 generate 调用提交一个 <code>metadata.payload</code>，完成后将轨迹映射为多个 slime Sample。</p><p>奖励归一化按 <code>group_index</code> 分组，按 <code>rollout_id</code> 去重，防止分叉多的 episode 重复影响组均值。缺失奖励交回 slime 后续 reward 路径处理。</p><p>调用失败并不总是 ABORTED：已有可用轨迹时可零奖保留；无有效记录才用 <code>ABORTED + remove_sample=True</code> 排除。</p></article>
         <article class="card"><span class="tag amber">backends/slime</span><h3>整批 rollout hook</h3><p>当前仍启动外部 <code>rllm_model_gateway</code> 子进程；不是仓内新网关。按 session URL 路由，将整个 metadata 作为 Agent 输入，整批收集并转换轨迹。</p><p>相邻 token 前缀精确延伸才合并，否则切段；工具桥接内容 mask=0。按任务与 gateway session 归一化，并处理 DP 补齐行。</p><p>训练侧调用或转换抛出异常、或轨迹为空时，产生零梯度 FAILED 占位，其零奖励仍会进入组基线。但当前未检查 S3 的 Agent 错误状态；Agent 报错前已生成的轨迹，仍可能按零奖励参与训练。</p></article>
       </div>
       <p>两者都有接入代码，目录名不是“已废弃”或“已验证”的证据。GPU 训练环境和 slime / Megatron 仍需独立准备；具体命令、模型和 CUDA 约束应查各自 setup，而非混用。</p>
-      <p class="source">源码：<a href="../src/agentcore_rl_toolkit/backends/experimental/slime/integration/rollout.py">实验 hook</a><a href="../src/agentcore_rl_toolkit/backends/experimental/slime/integration/rewards.py">episode 奖励归一化</a><a href="../src/agentcore_rl_toolkit/backends/slime/integration/gateway.py">外置网关启动</a><a href="../src/agentcore_rl_toolkit/backends/slime/integration/rollout.py">原有整批路径</a></p>
+      <p class="source">源码：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/experimental/slime/integration/rollout.py">实验 hook</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/experimental/slime/integration/rewards.py">episode 奖励归一化</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/slime/integration/gateway.py">外置网关启动</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/slime/integration/rollout.py">原有整批路径</a></p>
     </section>
     <section id="sandbox">
       <div class="section-top"><span class="number">08</span><h2>Sandbox 与基础设施支撑</h2></div>
@@ -393,7 +393,7 @@ verl 推理服务
         <tr><td><code>aws_tools</code></td><td>凭证、连接、签名、部署、会话操作、容量池诊断和状态字典。</td><td>Agent 的工具菜单，或 token 轨迹存储层。</td></tr>
       </tbody></table></div>
       <p>例如 <code>PersistentDict</code> 用于持久化编排信息，不是 sandboxd 的终态文件存储；<code>EC2Monitor</code> 补充容量池实例诊断，也不直接负责 RL 优化调度。</p>
-      <p class="source">源码与设计：<a href="../src/agentcore_rl_toolkit/sandbox/client.py">Sandbox SDK</a><a href="../sandboxd/process.go">进程管理</a><a href="../sandboxd/store.go">终态存储</a><a href="../src/agentcore_rl_toolkit/concurrency/priority_semaphore.py">优先级 semaphore</a><a href="../designs/sandbox_sdk.md">SDK 设计</a><a href="../examples/sandbox_quickstart/README.md">Sandbox quickstart</a></p>
+      <p class="source">源码与设计：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/sandbox/client.py">Sandbox SDK</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/process.go">进程管理</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/store.go">终态存储</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/concurrency/priority_semaphore.py">优先级 semaphore</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/designs/sandbox_sdk.md">SDK 设计</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/examples/sandbox_quickstart/README.md">Sandbox quickstart</a></p>
     </section>
 
     <section id="contracts">
@@ -414,7 +414,7 @@ verl 推理服务
       <details open><summary>超时和清理必须按调用路径理解</summary><p>S3 Future 成功回收和显式等待超时会尝试 stop，但任意 HEAD/GET 异常、外部取消、提交失败或提前退出迭代，不能概括成“都自动清理”。HTTP handle 等待超时不取消执行；HTTP Session 上下文才负责收尾。stop 是 best-effort，调用过并不证明远端已释放。</p></details>
       <details open><summary>网关截断与训练失败不是同一个状态机</summary><p>上下文预算可能在生成前拒绝请求，后端也可能返回 length 完成原因。导出记录还可被长度上限裁切；不能只看 TraceRecord.status 就判断所有截断。各训练后端结合上下文耗尽标记、错误原因和已有 token 决定零奖保留还是丢弃。</p></details>
       <details open><summary>真实可达性与模型一致性仍是部署前提</summary><p>ACR 内的 Agent 必须能访问训练侧网关；base_url 应符合所用 SDK 的路径规则。网关 tokenizer / chat template 必须与采样模型一致，模型工具语法必须有解析支持。单元测试中的 fake backend 不能替代这几项部署验证。</p></details>
-      <p class="source">重点核对：<a href="../src/agentcore_rl_toolkit/rollout_session/wire.py">统一结果</a><a href="../src/agentcore_rl_toolkit/backends/verl/rollout_failure.py">verl 失败分类</a><a href="../src/agentcore_rl_toolkit/runtime/protocol.py">HTTP 协议</a><a href="../src/agentcore_rl_toolkit/sandbox/types.py">Sandbox 结果 / 异常</a></p>
+      <p class="source">重点核对：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_session/wire.py">统一结果</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/rollout_failure.py">verl 失败分类</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/protocol.py">HTTP 协议</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/sandbox/types.py">Sandbox 结果 / 异常</a></p>
     </section>
     <section id="walkthrough">
       <div class="section-top"><span class="number">10</span><h2>一条数学任务走完全程</h2></div>
@@ -442,26 +442,26 @@ def invoke_agent(payload, context):
     # 创建 Agent，运行工具与对话，提取最终文本……
     return {"rewards": reward_fn(response_text=text, ground_truth=answer)}</code></pre>
       <div class="callout"><strong>最小接入思路：</strong>保留业务工具和 Agent 框架，切换入口封装，让模型配置按请求注入，再实现可评分输出。若接 Tinker，应使用它的 HTTP 入口、平铺任务、<code>_config</code> 和单数 reward，而不是直接照搬这段 S3 示例。</div>
-      <p class="source">可运行实现：<a href="../examples/strands_math_agent/basic_app.py">生产形态 basic_app</a><a href="../examples/strands_math_agent/rl_app.py">RL 形态 rl_app</a><a href="../examples/strands_math_agent/reward.py">GSM8KReward</a></p>
+      <p class="source">可运行实现：<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/basic_app.py">生产形态 basic_app</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/rl_app.py">RL 形态 rl_app</a><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/reward.py">GSM8KReward</a></p>
     </section>
 
     <section id="reading">
       <div class="section-top"><span class="number">11</span><h2>源码阅读与验证路线</h2></div>
       <p class="lead">先读接口边界，再读内部算法，最后进入某个训练器。详细 API 与配置以对应源码和主文档为准。</p>
       <div class="table-wrap"><table><thead><tr><th scope="col">目标</th><th scope="col">建议阅读顺序</th><th scope="col">应回答的问题</th></tr></thead><tbody>
-        <tr><td>接入一个 Agent</td><td><a href="../examples/strands_math_agent/rl_app.py">math rl_app</a> → <a href="../src/agentcore_rl_toolkit/app.py">app.py</a> → <a href="../src/agentcore_rl_toolkit/client.py">client.py</a></td><td>配置从哪里来？奖励和最终结果写到哪里？</td></tr>
-        <tr><td>理解可恢复调用</td><td><a href="../src/agentcore_rl_toolkit/runtime/protocol.py">protocol</a> → <a href="../src/agentcore_rl_toolkit/runtime/app.py">app</a> → <a href="../src/agentcore_rl_toolkit/runtime/store.py">store</a> → <a href="../src/agentcore_rl_toolkit/runtime/client.py">client</a></td><td>谁拥有执行？同 ID 重试和断连会发生什么？</td></tr>
-        <tr><td>理解训练数据</td><td><a href="../src/agentcore_rl_toolkit/rollout_gateway/trace.py">trace</a> → <a href="../src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">adapter</a> → <a href="../src/agentcore_rl_toolkit/rollout_gateway/trajectory.py">trajectory</a> → <a href="../src/agentcore_rl_toolkit/rollout_gateway/linear.py">linear</a></td><td>每个 token 的来源与 mask 是什么？为什么拆行？</td></tr>
-        <tr><td>接新推理服务</td><td><a href="../src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/base.py">SamplingBackend</a> → <a href="../src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/sglang_http.py">SGLang 实现</a> → <a href="../src/agentcore_rl_toolkit/rollout_gateway/render.py">renderer</a></td><td>能否接收精确 token、返回对应概率并正确解析？</td></tr>
-        <tr><td>改训练编排</td><td><a href="../src/agentcore_rl_toolkit/backends/tinker_api/train.py">Tinker loop</a> 或 <a href="../src/agentcore_rl_toolkit/backends/verl/agent_loop.py">verl AgentLoop</a> → 对应 data / trainer</td><td>episode、trace 行、mini-batch 和 optimizer step 如何对应？</td></tr>
-        <tr><td>做程序沙箱</td><td><a href="../src/agentcore_rl_toolkit/sandbox/client.py">SDK</a> → <a href="../sandboxd/main.go">HTTP dispatch</a> → <a href="../sandboxd/process.go">process</a> → <a href="../sandboxd/store.go">store</a></td><td>何时算执行完成？谁持久化结果？谁终止后代进程？</td></tr>
+        <tr><td>接入一个 Agent</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/rl_app.py">math rl_app</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/app.py">app.py</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/client.py">client.py</a></td><td>配置从哪里来？奖励和最终结果写到哪里？</td></tr>
+        <tr><td>理解可恢复调用</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/protocol.py">protocol</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/app.py">app</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/store.py">store</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/runtime/client.py">client</a></td><td>谁拥有执行？同 ID 重试和断连会发生什么？</td></tr>
+        <tr><td>理解训练数据</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/trace.py">trace</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/adapters/common.py">adapter</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/trajectory.py">trajectory</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/linear.py">linear</a></td><td>每个 token 的来源与 mask 是什么？为什么拆行？</td></tr>
+        <tr><td>接新推理服务</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/base.py">SamplingBackend</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/sampling_backends/sglang_http.py">SGLang 实现</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/render.py">renderer</a></td><td>能否接收精确 token、返回对应概率并正确解析？</td></tr>
+        <tr><td>改训练编排</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/train.py">Tinker loop</a> 或 <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/verl/agent_loop.py">verl AgentLoop</a> → 对应 data / trainer</td><td>episode、trace 行、mini-batch 和 optimizer step 如何对应？</td></tr>
+        <tr><td>做程序沙箱</td><td><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/sandbox/client.py">SDK</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/main.go">HTTP dispatch</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/process.go">process</a> → <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/store.go">store</a></td><td>何时算执行完成？谁持久化结果？谁终止后代进程？</td></tr>
       </tbody></table></div>
       <h3>用测试读契约</h3>
       <ul>
-        <li><a href="../tests/rollout_gateway/test_trajectory.py">test_trajectory.py</a>：CLEAN / FORK、共享前缀与 mask；<a href="../tests/rollout_gateway/test_linear_healer.py">test_linear_healer.py</a>：线性修复与回退策略。</li>
-        <li><a href="../tests/runtime/test_app.py">runtime/test_app.py</a> 与 <a href="../tests/runtime/test_http_client.py">test_http_client.py</a>：同 ID、断连、存储失败、handle 与超时。</li>
-        <li><a href="../tests/backends/verl/test_training_worker_batching.py">verl worker batching</a>：可变行数下的更新次数；<a href="../tests/backends/tinker_api/test_data.py">Tinker data</a>：next-token 移位与 episode 归一化。</li>
-        <li><a href="../tests/sandbox/test_daemon.py">Sandbox daemon 契约测试</a> 与 <a href="../sandboxd/process_test.go">Go process tests</a>：执行所有权、输出 EOF、超时和持久化。</li>
+        <li><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/rollout_gateway/test_trajectory.py">test_trajectory.py</a>：CLEAN / FORK、共享前缀与 mask；<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/rollout_gateway/test_linear_healer.py">test_linear_healer.py</a>：线性修复与回退策略。</li>
+        <li><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/runtime/test_app.py">runtime/test_app.py</a> 与 <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/runtime/test_http_client.py">test_http_client.py</a>：同 ID、断连、存储失败、handle 与超时。</li>
+        <li><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/backends/verl/test_training_worker_batching.py">verl worker batching</a>：可变行数下的更新次数；<a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/backends/tinker_api/test_data.py">Tinker data</a>：next-token 移位与 episode 归一化。</li>
+        <li><a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/tests/sandbox/test_daemon.py">Sandbox daemon 契约测试</a> 与 <a href="https://github.com/xiehust/agentcore-rl-toolkit/blob/main/sandboxd/process_test.go">Go process tests</a>：执行所有权、输出 EOF、超时和持久化。</li>
       </ul>
       <pre><code># 已具备相应开发依赖时，在仓库根目录运行
 uv run pytest tests/runtime/test_app.py tests/runtime/test_http_client.py
