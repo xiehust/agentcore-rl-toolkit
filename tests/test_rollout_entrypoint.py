@@ -11,6 +11,25 @@ from starlette.testclient import TestClient
 from agentcore_rl_toolkit import AgentCoreRLApp
 
 
+@pytest.fixture(autouse=True)
+def mock_s3_client(monkeypatch):
+    """Replace the client factory before app construction, including signature-only tests."""
+    s3 = MagicMock(spec_set=["put_object"])
+
+    def client(service_name):
+        assert service_name == "s3"
+        return s3
+
+    monkeypatch.setattr("agentcore_rl_toolkit.app.boto3.client", client)
+    return s3
+
+
+def test_app_uses_mock_s3_client(mock_s3_client):
+    app = AgentCoreRLApp()
+    assert app.s3_client is mock_s3_client
+    mock_s3_client.put_object.assert_not_called()
+
+
 def test_wrapper_signature_has_context():
     """Test that the wrapper's signature includes (payload, context) for BedrockAgentCoreApp."""
     app = AgentCoreRLApp()
@@ -96,25 +115,36 @@ def test_response_includes_result_location_with_rollout_config():
     async def handler(payload: dict):
         return {"rollout_data": [{"test": True}], "rewards": [1.0]}
 
-    client = TestClient(app)
-    response = client.post(
-        "/invocations",
-        json={
-            "prompt": "test",
-            "_rollout": {
-                "exp_id": "exp-123",
-                "input_id": "input-789",
-                "s3_bucket": "my-bucket",
-            },
+    payload = {
+        "prompt": "test",
+        "_rollout": {
+            "exp_id": "exp-123",
+            "input_id": "input-789",
+            "s3_bucket": "my-bucket",
         },
-        headers={"X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": "sess-456"},
-    )
+    }
+    response = _invoke_and_wait_for_s3(app, payload, session_id="sess-456")
 
     assert response.status_code == 200
     result = response.json()
     assert result["status"] == "processing"
     assert result["s3_bucket"] == "my-bucket"
     assert result["result_key"] == "exp-123/input-789/sess-456.json"
+
+    app.s3_client.put_object.assert_called_once()
+    saved = app.s3_client.put_object.call_args.kwargs
+    assert saved["Bucket"] == result["s3_bucket"]
+    assert saved["Key"] == result["result_key"]
+    assert saved["ContentType"] == "application/json"
+    body = json.loads(saved["Body"])
+    assert body["status_code"] == 200
+    assert body["stop_reason"] == "end_turn"
+    assert body["rollout_data"] == [{"test": True}]
+    assert body["rewards"] == [1.0]
+    assert body["input_id"] == "input-789"
+    assert body["s3_bucket"] == result["s3_bucket"]
+    assert body["result_key"] == result["result_key"]
+    assert body["payload"] == payload
 
 
 def test_response_without_rollout_config():
@@ -272,28 +302,30 @@ _ROLLOUT_CONFIG = {
 
 
 def _make_app_with_mock_s3(handler_fn):
-    """Create an AgentCoreRLApp with mocked S3 client and register the handler."""
+    """Create an app with the fixture's S3 client and register the handler."""
     app = AgentCoreRLApp()
-    app.s3_client = MagicMock()
-
     app.rollout_entrypoint(handler_fn)
-
     return app
 
 
-def _invoke_and_wait_for_s3(app, payload, *, timeout=5.0):
-    """POST to /invocations and wait for the background task to call put_object."""
-    client = TestClient(app)
-    response = client.post(
-        "/invocations",
-        json=payload,
-        headers={"X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": "sess-test"},
-    )
+def _invoke_and_wait_for_s3(app, payload, *, session_id="sess-test", timeout=5.0):
+    """Keep the event loop alive until the background task saves and finishes."""
+    with TestClient(app) as client:
+        response = client.post(
+            "/invocations",
+            json=payload,
+            headers={"X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id},
+        )
+        assert response.status_code == 200
 
-    # Poll until the background task calls put_object
-    deadline = time.monotonic() + timeout
-    while app.s3_client.put_object.call_count == 0 and time.monotonic() < deadline:
-        time.sleep(0.05)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if app.s3_client.put_object.called and app.get_async_task_info()["active_count"] == 0:
+                break
+            time.sleep(0.05)
+
+        assert app.s3_client.put_object.called, "background rollout did not save to mock S3"
+        assert app.get_async_task_info()["active_count"] == 0, "background rollout did not finish"
 
     return response
 
@@ -369,3 +401,32 @@ def test_s3_save_backward_compat_rollout_and_rewards():
     assert body["stop_reason"] == "end_turn"
     assert body["input_id"] == "input-001"
     assert body["s3_bucket"] == "test-bucket"
+
+
+@pytest.mark.parametrize("fail_in_handler", [True, False], ids=["handler-error", "non-dict-result"])
+def test_s3_save_error_result(fail_in_handler):
+    """An accepted invocation must still persist an error from its background task."""
+
+    async def handler(payload: dict):
+        if fail_in_handler:
+            raise ValueError("agent failed")
+        return ["not a dict"]
+
+    app = _make_app_with_mock_s3(handler)
+    payload = {"prompt": "test", "_rollout": _ROLLOUT_CONFIG}
+    response = _invoke_and_wait_for_s3(app, payload)
+
+    assert response.json()["status"] == "processing"
+    app.s3_client.put_object.assert_called_once()
+    saved = app.s3_client.put_object.call_args.kwargs
+    assert saved["Bucket"] == "test-bucket"
+    assert saved["Key"] == response.json()["result_key"]
+    body = json.loads(saved["Body"])
+    assert body["status_code"] == 500
+    reason = "agent failed" if fail_in_handler else "Return value must be a dict when S3 save is configured, got list"
+    assert body["stop_reason"] == reason
+    assert "ValueError" in body["traceback"]
+    assert body["input_id"] == "input-001"
+    assert body["s3_bucket"] == "test-bucket"
+    assert body["result_key"] == saved["Key"]
+    assert body["payload"] == payload
