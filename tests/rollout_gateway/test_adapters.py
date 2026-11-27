@@ -41,7 +41,7 @@ class FakeRenderer:
     def get_stop_sequences(self):
         return []
 
-    def parse(self, output_ids, *, tools_schema=None):
+    def parse(self, output_ids, *, finish_reason, tools_schema=None):
         inv = {v: k for k, v in self.vocab.items()}
         text = " ".join(inv.get(i, "?") for i in output_ids)
         return ParsedOutput(reasoning="", text=text, tool_uses=[], ill_formed=False)
@@ -140,3 +140,56 @@ async def test_bearer_sid_isolates_sessions():
         assert recs_solver[0].token_ids != recs_critic[0].token_ids
     finally:
         await client.close()
+
+
+async def _post_tools(tools):
+    renderer = FakeRenderer()
+    backend = FakeBackend(renderer, replies=["ok"])
+    adapter = OpenAIAdapter(backend=backend, renderer=renderer, tokenizer=None)
+    client = TestClient(TestServer(adapter.app))
+    await client.start_server()
+    try:
+        body = {"model": "x", "messages": [{"role": "user", "content": "hi"}], "tools": tools}
+        resp = await client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer s"})
+        return resp.status, await resp.json(), backend
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "message"),
+    [
+        pytest.param(
+            [{"type": "function", "name": "calc", "parameters": {"type": "object"}}],
+            "tools[0]: missing 'function' object",
+            id="responses-flat-shape",
+        ),
+        pytest.param(
+            [{"type": "custom", "custom": {"name": "grammar"}}],
+            "tools[0]: unsupported tool type 'custom'",
+            id="non-function-type",
+        ),
+        pytest.param(
+            [{"type": "function", "function": {"name": "ok"}}, {"type": "function", "function": {}}],
+            "tools[1].function.name must be a non-empty string",
+            id="missing-name",
+        ),
+        pytest.param(["calc"], "tools[0]: expected", id="non-dict-entry"),
+        pytest.param({"type": "function"}, "tools must be a list", id="not-a-list"),
+    ],
+)
+async def test_openai_adapter_rejects_invalid_tools(tools, message):
+    status, data, backend = await _post_tools(tools)
+    assert status == 400
+    assert data["error"]["type"] == "invalid_request_error"
+    assert data["error"]["param"] == "tools"
+    assert data["error"]["message"].startswith(message)
+    assert backend.calls == []  # rejected before sampling
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_accepts_nested_tool_without_type():
+    status, _, backend = await _post_tools([{"function": {"name": "calc"}}])
+    assert status == 200
+    assert len(backend.calls) == 1

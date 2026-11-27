@@ -10,6 +10,7 @@ api-key / Bearer slot (the adapters resolve it via ``sid_from_bearer``); the age
 ``base_url`` is a plain fixed gateway address — there are no per-session URLs.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import web
@@ -17,9 +18,9 @@ from aiohttp import web
 from .adapters.anthropic import AnthropicAdapter
 from .adapters.common import BaseAdapter, _health
 from .adapters.openai import OpenAIAdapter
-from .linear import LinearHealer
+from .linear import LinearHealer, make_healer
 from .render import Renderer
-from .sampling_backends.base import SamplingBackend
+from .sampling_backends.base import SamplingBackend, supports_top_logprobs
 from .trace import BaseTrace, TraceRecord
 from .trajectory import TrajectoryManager
 
@@ -41,17 +42,20 @@ class RolloutGateway:
         adapters: which wire protocols to mount — names ("openai", "anthropic") or
             ``BaseAdapter`` subclasses. Defaults to both.
         max_turns_per_sid / debug_callback: forwarded to the adapters.
-        history_mode: ``"tree"`` (default) or ``"linear"``. In linear mode the gateway
+        history_mode: ``"linear"`` (default) or ``"tree"``. In linear mode the gateway
             heals re-tokenization drift at generation time via one shared ``LinearHealer``
-            so the manager stays CLEAN (one sample per session). See ``linear.py``.
+            so every branch of the session tree stays CLEAN (one sample per append-only
+            session). See ``linear.py``.
         linear_on_nonlinear: ``"reset"`` (default) | ``"error"`` | ``"passthrough"`` —
-            behaviour when a turn breaks the append-only assumption (linear mode only).
+            behaviour when a request does not extend the session's latest turn (linear
+            mode only).
         require_registered_sessions: opt-in auth guard (default ``False``). When ``True``,
-            only sids pre-registered via ``create_session`` may drive a turn; any other
-            Bearer is refused ``401`` instead of implicitly opening a session. Enable it
-            whenever the gateway port is reachable from outside a trusted network (ACR
-            containers calling back to a trainer EC2), so a stranger cannot POST an
-            arbitrary Bearer for free inference and pollute the trajectory trees.
+            only sids registered via ``create_session`` may drive a turn; any other
+            Bearer is refused with ``401`` instead of implicitly opening a session.
+            Health and ``/v1/models`` probes stay unauthenticated. Enable it whenever
+            the gateway port is reachable from outside a trusted network, so a caller
+            cannot POST an arbitrary Bearer for free inference and pollute the
+            trajectory trees.
     """
 
     def __init__(
@@ -61,7 +65,7 @@ class RolloutGateway:
         renderer: Renderer,
         tokenizer=None,
         adapters: list[str | type[BaseAdapter]] | None = None,
-        history_mode: str = "tree",
+        history_mode: str = "linear",
         linear_on_nonlinear: str = "reset",
         max_turns_per_sid: int | None = None,
         debug_callback: Any = None,
@@ -74,11 +78,9 @@ class RolloutGateway:
         self.manager = TrajectoryManager()
 
         # In linear mode, one healer is shared across all co-mounted adapters (like the
-        # manager) so a session's canonical served-id state is coherent regardless of
-        # which wire protocol its turns arrive on. See linear.py.
-        self.healer: LinearHealer | None = (
-            LinearHealer(renderer, on_nonlinear=linear_on_nonlinear) if history_mode == "linear" else None
-        )
+        # manager) so its counters cover a session whichever wire protocol its turns
+        # arrive on. See linear.py.
+        self.healer: LinearHealer | None = make_healer(history_mode, renderer, self.manager, linear_on_nonlinear)
 
         # one aiohttp app shared by all adapters; register health once here.
         self.app = web.Application(client_max_size=64 * 1024 * 1024)
@@ -93,10 +95,11 @@ class RolloutGateway:
                 backend=backend,
                 renderer=renderer,
                 tokenizer=tokenizer,
+                history_mode=history_mode,
                 max_turns_per_sid=max_turns_per_sid,
                 debug_callback=debug_callback,
                 manager=self.manager,  # SHARED across adapters -> one tree per sid
-                healer=self.healer,  # SHARED across adapters -> coherent canonical state
+                healer=self.healer,  # SHARED across adapters -> one set of per-session counters
                 app=self.app,  # SHARED app -> all routes on one server
                 require_registered_sessions=require_registered_sessions,
             )
@@ -110,17 +113,26 @@ class RolloutGateway:
         *,
         sampling_defaults: dict | None = None,
         max_context_tokens: int = 0,
+        num_top_logprobs: int = 0,
+        validate_sampling_params: Callable[[dict], None] | None = None,
     ) -> None:
         """Register a fresh per-sid session. Registers on every adapter so a turn on
-        any protocol under this sid finds its Session state."""
-        for adapter in self.adapters:
-            adapter.open_session(sid, sampling_defaults=sampling_defaults, max_context_tokens=max_context_tokens)
+        any protocol under this sid finds its Session state.
 
-    def context_exhausted(self, sid: str) -> bool:
-        """True once any adapter answered a turn for ``sid`` with a context-limit
-        error. Per-session state consumed by ``finish_session``/``drop_session``,
-        so read it before draining the session."""
-        return any(getattr(adapter.store.get(sid), "context_exhausted", False) for adapter in self.adapters)
+        ``num_top_logprobs > 0`` asks the backend for the sampler's top-``K`` head at each
+        output position (see ``SamplingBackend``). ``validate_sampling_params`` receives a
+        copy of each turn's final sampling params, after the agent's overrides; a
+        ``ValueError`` from it fails the turn with HTTP 400 before generation."""
+        if num_top_logprobs and not supports_top_logprobs(self.backend):
+            raise ValueError(f"{type(self.backend).__name__} cannot return top logprobs")
+        for adapter in self.adapters:
+            adapter.open_session(
+                sid,
+                sampling_defaults=sampling_defaults,
+                max_context_tokens=max_context_tokens,
+                num_top_logprobs=num_top_logprobs,
+                validate_sampling_params=validate_sampling_params,
+            )
 
     async def finish_session(
         self,

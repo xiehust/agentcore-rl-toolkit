@@ -1,0 +1,25 @@
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+WORKDIR /app
+
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_PROGRESS=1 \
+    PYTHONUNBUFFERED=1 \
+    DOCKER_CONTAINER=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/sierra-research/tau2-bench.git /opt/tau2-bench && \
+    cd /opt/tau2-bench && git checkout 70e700c && \
+    uv pip install -e .
+
+COPY . .
+RUN uv pip install . aws-opentelemetry-distro==0.12.2
+
+RUN useradd -m -u 1000 bedrock_agentcore
+USER bedrock_agentcore
+
+EXPOSE 8080
+CMD ["opentelemetry-instrument", "python", "-m", "rl_app"]

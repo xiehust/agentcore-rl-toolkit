@@ -57,11 +57,14 @@ docs/
 
 # Project specific
 tests/
+train/
 
 # Bedrock AgentCore specific - keep config but exclude runtime files
 .bedrock_agentcore.yaml
 .dockerignore
 .bedrock_agentcore/
+config.toml
+.env.*
 
 # Keep wheelhouse for offline installations
 # wheelhouse/

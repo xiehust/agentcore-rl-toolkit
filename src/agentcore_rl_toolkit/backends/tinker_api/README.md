@@ -20,12 +20,13 @@ From a toolkit checkout:
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-uv pip install -e '.[rollout,gateway,tinker_api]' 'transformers==5.12.1' datasets wandb
+uv pip install -e '.[tinker_api]' datasets wandb
 ```
 
-`datasets` is used to prepare the math example; `wandb` enables optional logging.
+The backend extra includes rollout clients and the gateway. `datasets` is used to prepare
+the math example; `wandb` enables optional logging.
 
-> **SkyRL:** Replace `.[rollout,gateway,tinker_api]` with `.[rollout,gateway,tinker_skyrl]` to use
+> **SkyRL:** Replace `.[tinker_api]` with `.[tinker_skyrl]` to use
 > SDK 0.24.1. The tested SkyRL version does not return `sample_sequence_ids`,
 > which SDK 0.30.1 requires. The two extras are mutually exclusive and share the
 > same training loop.
@@ -96,6 +97,13 @@ Each dataset row is an agent invocation payload, for example
 `reward`. Failed rollouts with captured training tokens receive zero reward;
 rollouts with no training tokens are excluded from scoring and training.
 Groups with no reward variation are skipped.
+
+`rollout_concurrency` optionally limits the number of active training agents without
+changing `batch_size * group_size`, rollout grouping, or the single synchronous
+policy update. Its default (`null`) launches the whole batch concurrently.
+`evaluation_batch_size` is a rolling concurrency limit: each completed evaluation
+agent immediately frees a slot for another task, without waiting for a batch's
+slowest agent.
 
 The output directory contains rollout records, metrics, evaluation results
 when enabled, and checkpoint paths on the endpoint. Set `wandb_project` to

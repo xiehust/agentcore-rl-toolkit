@@ -4,6 +4,8 @@ This agent tackles the problem of code migration from Java 8 to Java 17 as intro
 It builds upon the official [JavaMigrationAgent](https://github.com/amazon-science/JavaMigration/tree/main/java_migration_agent) with open source LLMs.
 This example is under active development alongside the `agentcore-rl-toolkit` library.
 
+See [Training with verl](train/verl/README.md) for GRPO training.
+
 ## Basic Setup
 
 Before running the agent, verify that Java 17 and Maven 3.9.6 are installed:
@@ -80,27 +82,23 @@ mvn --version
 
 ## Installation
 
-Set the repo root and migration agent paths — these variables are used throughout this document:
+Run from the repository root:
 
 ```bash
-export TOOLKIT_ROOT=/path/to/your/agentcore-rl-toolkit/repo
-export MIGRATION_DIR=$TOOLKIT_ROOT/examples/strands_migration_agent
-
-cd $MIGRATION_DIR
+cd examples/strands_migration_agent
 
 uv venv --python 3.13
 source .venv/bin/activate
 uv pip install -e .
-uv pip install -e ../../ --force-reinstall --no-deps # install the parent repo
 ```
+
+Run the remaining commands from `examples/strands_migration_agent`.
 
 ## Run locally
 
 First, preprocess the MigrationBench dataset and upload to S3:
 
 ```bash
-cd $MIGRATION_DIR
-
 # Create S3 bucket if needed
 aws s3 mb s3://my-migration-bench-data
 
@@ -124,9 +122,8 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 ```
 
 ```bash
-# Terminal 2: Start the app server with hot reloading (from $MIGRATION_DIR)
-cd $MIGRATION_DIR
-uvicorn rl_app:app --port 8080 --reload --reload-dir ../..
+# Terminal 2: Start the app server with hot reloading from the example directory
+uvicorn rl_app:app --port 8080 --reload
 ```
 
 ```bash
@@ -140,11 +137,8 @@ curl -X POST http://localhost:8080/invocations \
     "require_maximal_migration": false,
     "use_dependency_search_tool": true,
     "apply_static_update": true,
-    "_rollout": {
-        "exp_id": "dev",
-        "s3_bucket": "agentcore-rl",
-        "session_id": "session_x",
-        "input_id": "prompt_y",
+    "_config": {
+        "api_key": "EMPTY",
         "base_url": "http://localhost:4000/v1",
         "model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         "sampling_params": {"max_completion_tokens": 8192}
@@ -196,83 +190,55 @@ CODEARTIFACT_OWNER=123456789012
 CODEARTIFACT_REPO=maven-central-cache
 ```
 
+Set `CODEARTIFACT_REGION` when the mirror is in a different AWS region from the
+agent.
+For Runtime deployment, pass it with `--env CODEARTIFACT_REGION=<mirror-region>`.
+
 When these environment variables are not set, the agent uses Maven Central directly (default behavior). At startup, `configure_codeartifact_token()` fetches an auth token via boto3 and generates `~/.m2/settings.xml` automatically.
 
 
 ## Deploy to AgentCore
 
-### 1. Configure the agent
-
-Pick the option that matches where your inference server lives.
-
-**Option 1: VPC deployment** — use this when your inference server is inside a VPC (e.g., training infra on AWS).
+Run from `examples/strands_migration_agent`. Set the subnet and security group IDs for the
+host running your inference server:
 
 ```bash
-cd $MIGRATION_DIR
+uv tool install bedrock-agentcore-starter-toolkit
 
-# Get your subnet and security group IDs from your instance's network details
-SUBNET_ID="subnet-xxxxxxxxxxxxxxxxx"
-SECURITY_GROUP_ID="sg-xxxxxxxxxxxxxxxxx"
-
-agentcore configure \
-  --entrypoint rl_app.py \
-  --name strands_migration_agent \
-  --requirements-file pyproject.toml \
-  --deployment-type container \
-  --vpc \
-  --subnets $SUBNET_ID \
-  --security-groups $SECURITY_GROUP_ID \
-  --disable-memory \
-  --non-interactive
+agentcore configure --entrypoint rl_app.py --name strands_migration_agent \
+  --requirements-file pyproject.toml --deployment-type container --protocol HTTP \
+  --vpc --subnets subnet-xxxxxxxxxxxxxxxxx --security-groups sg-xxxxxxxxxxxxxxxxx \
+  --disable-memory --non-interactive
+agentcore deploy --agent strands_migration_agent
 ```
 
-**Option 2: Public net deployment** — use this when your inference server is accessible via a public URL.
+For a publicly reachable inference server, omit the VPC flags.
+If using the CodeArtifact mirror, pass its settings to the deploy command:
 
 ```bash
-cd $MIGRATION_DIR
-
-agentcore configure \
-  --entrypoint rl_app.py \
-  --name strands_migration_agent \
-  --requirements-file pyproject.toml \
-  --deployment-type container \
-  --disable-memory \
-  --non-interactive
-```
-
-### 2. Deploy the agent
-
-```bash
-cd $MIGRATION_DIR
-
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-
 agentcore deploy --agent strands_migration_agent \
   --env CODEARTIFACT_DOMAIN=migration-aws-maven-mirror \
-  --env CODEARTIFACT_OWNER=$ACCOUNT \
+  --env CODEARTIFACT_OWNER=123456789012 \
   --env CODEARTIFACT_REPO=maven-central-cache
 ```
 
-> If you are not using the CodeArtifact mirror, omit the three `CODEARTIFACT_*` env vars from the deploy command.
+Set `AGENT_RUNTIME_ARN` to the ARN printed by the deployment. Run
+the deploy command again to redeploy after source changes.
 
-After deployment, the agent ARN is saved in `.bedrock_agentcore.yaml`. Copy it — you will need it for evaluation.
+### Runtime permissions
 
-### 3. Setup IAM Permissions for ACR
-Grant IAM permissions to the ACR execution role. The execution role name is stored in `.bedrock_agentcore.yaml` — the `execution_role` field, e.g.
-`arn:aws:iam::123456789:role/AmazonBedrockAgentCoreSDKRuntime-us-west-2-abc123` ->
-`AmazonBedrockAgentCoreSDKRuntime-us-west-2-abc123`.
-
-#### 3.1 Grant S3 permission
+Get the execution role for the deployed runtime:
 
 ```bash
-# Create an S3 bucket to store ACR rollout data
-aws s3 mb s3://agentcore-rl
+EXECUTION_ROLE_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
+  --agent-runtime-id "${AGENT_RUNTIME_ARN##*/}" \
+  --query roleArn --output text)
+YOUR_EXECUTION_ROLE="${EXECUTION_ROLE_ARN##*/}"
+```
 
-# Add S3 permissions to the execution role,
-# which is the first `execution_role` in `.bedrock_agentcore.yaml`.
-YOUR_EXECUTION_ROLE=$(grep -m1 'execution_role:' .bedrock_agentcore.yaml | sed 's|.*role/||')
-echo "Execution role: $YOUR_EXECUTION_ROLE"
+#### S3 access
 
+```bash
 aws iam put-role-policy --role-name $YOUR_EXECUTION_ROLE \
   --policy-name RLToolkitAccess \
   --policy-document '{
@@ -280,20 +246,18 @@ aws iam put-role-policy --role-name $YOUR_EXECUTION_ROLE \
     "Statement": [
       {
         "Effect": "Allow",
-        "Action": ["s3:PutObject", "s3:GetObject"],
-        "Resource": "arn:aws:s3:::agentcore-rl/*"
+        "Action": ["s3:GetObject"],
+        "Resource": "arn:aws:s3:::my-migration-bench-data/*"
       }
     ]
   }'
 ```
 
-#### 3.2 Grant CodeArtifact permission
+#### CodeArtifact access
 
 Skip this step if you are not using the [CodeArtifact mirror](#codeartifact-mirror-optional).
 
 ```bash
-cd $MIGRATION_DIR
-
 REGION=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].RegionName' --output text)
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
@@ -333,18 +297,15 @@ EOF
 
 ## Evaluate
 
-After deploying the agent to ACR, you can run batch evaluation against the MigrationBench dataset. The evaluation scripts use `RolloutClient` to submit requests to ACR and poll S3 for results.
-
-First, create `config.toml` from the example and fill in the `agent_arn` and `[eval]` section:
+To evaluate the deployed agent on MigrationBench, create `config.toml` and fill
+in its Runtime ARN, dataset path, and model settings:
 
 ```bash
-cd $MIGRATION_DIR
 cp config.example.toml config.toml
 ```
 
-- **`agent_arn`**: The ARN saved in `.bedrock_agentcore.yaml` after the deploy step.
+- **`agent_arn`**: The Runtime ARN printed by the deploy step.
 - **`s3_input_bucket`**: The S3 path where `preprocess.py` uploaded the dataset. For example, if you ran `python preprocess.py --s3-bucket-name my-migration-bench-data`, the test split is at `my-migration-bench-data/tars/test/`.
-- **`s3_output_bucket`**: The S3 bucket where evaluation rollout results will be saved.
 
 ```toml
 [agentcore]
@@ -352,17 +313,14 @@ agent_arn = "arn:aws:bedrock-agentcore:REGION:ACCOUNT_ID:runtime/AGENT_ID"
 
 [eval]
 s3_input_bucket = "my-migration-bench-data/tars/test/"
-s3_output_bucket = "agentcore-rl"
 base_url = "http://INFERENCE_SERVER_IP:4000/v1"
 model_id = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 sampling_params = {max_completion_tokens = 8192}
 ```
 
-### Sync evaluation
+### Run evaluation
 
 ```bash
-cd $MIGRATION_DIR
-
 # Run full evaluation
 python evaluate.py --exp_id my_eval --max_concurrent 50 --timeout 1800
 
@@ -370,32 +328,10 @@ python evaluate.py --exp_id my_eval --max_concurrent 50 --timeout 1800
 python evaluate.py --exp_id my_eval_test --limit 5
 ```
 
-### Async evaluation
-
-The async script supports two modes:
-- **batch** (default): Uses `run_batch_async()` with managed concurrency
-- **individual**: Uses `invoke_async()` + `gather` for fine-grained control
-
-```bash
-cd $MIGRATION_DIR
-
-# With custom concurrency and timeout
-python evaluate_async.py --mode batch --exp_id my_eval_async --max_concurrent 50 --timeout 1800
-```
-
-Note that all arguments can also be passed via CLI to override `config.toml` values.
-
-Both `evaluate.py` (sync) and `evaluate_async.py` (async) can run multiple agent instances concurrently via `--max_concurrent`. The difference is that the sync script submits requests sequentially — a slow submission (e.g., ACR cold start) blocks the next one — while the async script dispatches submissions as concurrent tasks so cold starts don't block each other.
-
-#### Connection pool sizing
-
-Both scripts accept `--max_pool_connections` (default: 10) to control the urllib3 connection pool size for boto3 clients. If this value is smaller than `--max_concurrent`, you may see urllib3 warnings like `"Connection pool is full, discarding connection"`. This is **not an error** — requests still succeed, but excess connections are created and discarded instead of being reused from the pool, adding minor TCP/TLS handshake overhead. If you want to eliminate these warnings, you can set `--max_pool_connections` to match `--max_concurrent`:
-
-```bash
-python evaluate.py --exp_id my_eval --max_concurrent 50 --max_pool_connections 50
-```
-
-Results are saved as JSONL files under `results/` (e.g., `results/my_eval.jsonl`).
+Use `--max_concurrent` to limit parallel tasks, `--tps_limit` to limit session
+starts per second, and `--timeout` to set the per-task deadline.
+Results are saved to `<output_dir>/<exp_id>.jsonl`; pass `--output_dir ./results`
+to choose a directory. The default is under the operating system's temporary directory.
 
 ## 📚 Citation
 If you use our work on code migration, please cite

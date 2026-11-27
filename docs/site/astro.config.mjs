@@ -40,12 +40,14 @@ export default defineConfig({
 				{
 					label: 'Setup Guide',
 					items: [
+						{ label: 'Installation', slug: 'guides/installation' },
 						{ label: 'Prepare agent for RL', slug: 'guides/agent-adaptation' },
 						{
 							label: 'Training Backends',
 							items: [
 								{ label: 'verl', slug: 'guides/verl-backend-setup' },
 								{ label: 'slime', slug: 'guides/slime-backend-setup' },
+								{ label: 'SageMaker', slug: 'guides/sagemaker-backend-setup' },
 								{
 									label: 'SkyRL ↗',
 									link: 'https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md',
@@ -93,6 +95,10 @@ export default defineConfig({
 							label: 'Async RL performance optimization',
 							slug: 'blog/async-rl-performance-optimization',
 						},
+						{
+							label: 'Training a SWE-Grep agent using ART and SkyRL Tinker',
+							slug: 'blog/training-swe-grep-agent-tinker',
+						},
 					],
 				},
 				{
@@ -101,17 +107,6 @@ export default defineConfig({
 						{
 							label: 'Core',
 							items: [{ autogenerate: { directory: 'api/core' } }],
-						},
-					],
-				},
-				{
-					label: 'Troubleshooting',
-					items: [
-						{
-							label: 'Training Backends',
-							items: [
-								{ label: 'slime', slug: 'troubleshooting/slime' },
-							],
 						},
 					],
 				},

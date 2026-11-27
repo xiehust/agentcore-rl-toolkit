@@ -22,7 +22,6 @@ This agent evaluates LLMs on the [OfficeBench](https://github.com/zlwang-cs/Offi
 ## Prerequisites
 
 - **AWS credentials**: IAM role with access to S3 and Bedrock AgentCore
-- **AgentCore CLI**: `bedrock-agentcore-starter-toolkit` (pulled in via the example's `pyproject.toml`)
 
 ## Installation
 
@@ -32,7 +31,6 @@ cd examples/strands_officebench_agent
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e .
-uv pip install -e ../../ --force-reinstall --no-deps  # install agentcore-rl-toolkit
 ```
 
 ## Quick Start
@@ -62,37 +60,29 @@ s3://your-bucket/officebench/
 └── manifest.json
 ```
 
-### 2. Configure the agent
+### 2. Deploy
 
-Use the AgentCore CLI to generate a config (`.bedrock_agentcore.yaml`) and a default Dockerfile (under `.bedrock_agentcore/strands_officebench_agent/`):
-
-```bash
-agentcore configure \
-    --entrypoint rl_app.py \
-    --name strands_officebench_agent \
-    --requirements-file pyproject.toml \
-    --deployment-type container \
-    --disable-memory \
-    --non-interactive
-```
-
-If your inference server lives inside a VPC (e.g. a vLLM server on an AWS instance), add `--vpc --subnets $SUBNET_ID --security-groups $SECURITY_GROUP_ID` so the agent can reach it.
-
-### 3. Override the generated Dockerfile
-
-OfficeBench needs system-level dependencies (LibreOffice, Tesseract, ImageMagick) and a clone of the OfficeBench app scripts — none of which the auto-generated Dockerfile provides. This example ships a custom `Dockerfile` at the folder root that adds them; copy it over the generated one:
+Run from `examples/strands_officebench_agent`:
 
 ```bash
-cp Dockerfile .bedrock_agentcore/strands_officebench_agent/Dockerfile
-```
+uv tool install bedrock-agentcore-starter-toolkit
 
-### 4. Deploy
-
-```bash
+agentcore configure --entrypoint rl_app.py --name strands_officebench_agent \
+  --requirements-file pyproject.toml --deployment-type container --protocol HTTP \
+  --disable-memory --non-interactive
 agentcore deploy --agent strands_officebench_agent
 ```
 
-This builds the ARM64 image (via CodeBuild), pushes it to ECR, and creates the AgentCore Runtime. The resulting `agent_arn` is recorded in `.bedrock_agentcore.yaml`.
+For a private vLLM server, add its VPC settings to `agentcore configure`:
+
+```bash
+  --vpc --subnets subnet-xxxxxxxxxxxxxxxxx --security-groups sg-xxxxxxxxxxxxxxxxx
+```
+
+Run `agentcore deploy --agent strands_officebench_agent` for subsequent deployments.
+
+The runtime execution role needs `s3:GetObject` on the task objects uploaded in
+step 1, and Bedrock model access when evaluating with Bedrock.
 
 Copy the config template and fill in the `agent_arn` (and any eval settings the benchmark scripts read):
 
@@ -100,10 +90,10 @@ Copy the config template and fill in the `agent_arn` (and any eval settings the 
 cp config.example.toml config.toml
 # Edit config.toml:
 #   agentcore.agent_arn = "<the arn agentcore deploy printed>"
-#   eval.s3_input_bucket / s3_output_bucket / model_id / base_url
+#   eval.s3_input_bucket / model_id / base_url
 ```
 
-### 5. Run benchmark
+### 3. Run benchmark
 
 ```bash
 # Full 300-task benchmark
@@ -119,10 +109,12 @@ python benchmark.py --exp_id my_run_1app --category 1
 python benchmark.py --exp_id my_run --resume
 ```
 
-Results are saved to:
+Set `--output_dir ./results` to save:
+
 - `results/{exp_id}/rollouts.jsonl` — per-task results with full conversation history
 - `results/{exp_id}/summary.json` — scores by category
-- `s3://{s3_output_bucket}/{exp_id}/...` — rollout data on S3
+
+The default output directory is under the operating system's temporary directory.
 
 > **Security note — where `task_uri`/`testbed_uri` come from, and why they are a trust
 > boundary.** `benchmark.py` lists the S3 prefix you populated in step 1
@@ -145,7 +137,7 @@ Results are saved to:
 
 ## Configuration
 
-Deployment settings (image URI, execution role, network mode, ECR repo, etc.) are managed by the AgentCore CLI in `.bedrock_agentcore.yaml` — you don't need to duplicate them in `config.toml`. What `config.toml` supplies to the benchmark scripts is the deployed `agent_arn` plus the evaluation-time settings:
+Set the deployed Runtime ARN and evaluation settings in `config.toml`:
 
 ```toml
 [agentcore]
@@ -153,21 +145,18 @@ agent_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/agent-id"
 
 [eval]
 s3_input_bucket = "s3://your-bucket/officebench/"
-s3_output_bucket = "your-output-bucket"
-model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+model_id = "us.anthropic.claude-sonnet-5-5"
 # base_url = "http://your-vllm-server:8000/v1"  # uncomment for vLLM
 ```
-
-To re-deploy with different network settings (e.g. attaching a VPC), re-run `agentcore configure` with the new flags and `agentcore deploy --agent strands_officebench_agent`.
 
 ### Switching models
 
 The model is configured at evaluation time (no redeployment needed):
 
 ```bash
-# Bedrock Claude Sonnet 4.5
-python benchmark.py --exp_id sonnet45 \
-    --model_id us.anthropic.claude-sonnet-4-5-20250929-v1:0
+# Bedrock Claude Sonnet 5.5
+python benchmark.py --exp_id sonnet55 \
+    --model_id us.anthropic.claude-sonnet-5-5
 
 # Bedrock Claude Haiku 4.5
 python benchmark.py --exp_id haiku45 \
@@ -192,7 +181,7 @@ python benchmark.py --exp_id thinking --thinking_budget 10000
 python benchmark.py --exp_id custom --temperature 0.5 --max_tokens 4096
 ```
 
-Note: thinking mode and temperature=0 are incompatible (Anthropic API requirement).
+Note: thinking mode and temperature=0 are incompatible (Anthropic API requirement). Claude Sonnet 5.5 rejects `--thinking_budget` and non-default `--temperature` or `--top_p` values (it thinks adaptively by default), so run these examples with `--model_id` set to a model that accepts them, such as Claude Haiku 4.5.
 
 ## Local Testing (no ACR)
 
@@ -204,7 +193,6 @@ cd examples/strands_officebench_agent
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e .
-uv pip install -e ../../ --force-reinstall --no-deps
 
 # The OfficeBench app scripts hardcode /testbed/ as the working directory.
 # Create a symlink so local runs write to /tmp/testbed/ instead:
@@ -224,15 +212,15 @@ OFFICEBENCH_DIR=/path/to/OfficeBench python run_local_eval.py --exp_id local_tes
 
 ```
 strands_officebench_agent/
-├── rl_app.py           # AgentCoreRLApp with @rollout_entrypoint (runs in ACR)
+├── rl_app.py           # Office agent and reward computation
 ├── tools.py            # 20 Strands @tool wrappers for OfficeBench apps
 ├── reward.py           # OfficeBenchReward with 9 evaluation functions
 ├── models.py           # Pydantic request models
 ├── utils.py            # S3 helpers (load task, setup testbed)
 ├── benchmark.py        # Full benchmark runner (ACR)
-├── evaluate.py         # Batch evaluation via RolloutClient (ACR, lower-level)
+├── evaluate.py         # Batch evaluation
 ├── preprocess.py       # Package OfficeBench tasks for S3
-├── Dockerfile          # Custom ACR container (LibreOffice, Tesseract, OfficeBench apps) — copy over the auto-generated one
+├── Dockerfile          # Custom ACR container (LibreOffice, Tesseract, OfficeBench apps)
 ├── test_local.py       # Single-task local testing (no ACR)
 ├── run_local_eval.py   # Batch local evaluation (no ACR)
 ├── config.toml         # Your configuration (gitignored)

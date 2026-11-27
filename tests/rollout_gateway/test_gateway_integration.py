@@ -1,13 +1,14 @@
 """Integration tests for ``RolloutGateway`` — the assembled serving unit."""
 
 import asyncio
+import dataclasses
 import json
 from contextlib import asynccontextmanager
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from agentcore_rl_toolkit.rollout_gateway import BaseTrace, RolloutGateway
+from agentcore_rl_toolkit.rollout_gateway import BaseTrace, RolloutGateway, TopLogprobs
 from agentcore_rl_toolkit.rollout_gateway.render import ParsedOutput
 from agentcore_rl_toolkit.rollout_gateway.trajectory import TurnRecord
 
@@ -51,7 +52,7 @@ class FakeRenderer:
     def get_stop_sequences(self):
         return []
 
-    def parse(self, output_ids, *, tools_schema=None):
+    def parse(self, output_ids, *, finish_reason, tools_schema=None):
         """Split a reply into leading text plus one tool use per ``CALL`` segment,
         mirroring render()'s ``content`` then ``CALL name k=v`` layout."""
         text = self.decode(output_ids)
@@ -86,6 +87,28 @@ class FakeBackend:
             finish_reason="stop",
             output_log_probs=[-0.5] * len(out_ids),
         )
+
+
+class FakeTopLogprobsBackend(FakeBackend):
+    """Also returns a K-wide head per output token when asked: row i = [token, token + 1, ...]."""
+
+    async def generate(
+        self,
+        *,
+        prompt_ids,
+        sampling_params,
+        session_id=None,
+        image_data=None,
+        video_data=None,
+        num_top_logprobs=0,
+    ):
+        turn = await super().generate(prompt_ids=prompt_ids, sampling_params=sampling_params, session_id=session_id)
+        self.calls[-1]["num_top_logprobs"] = num_top_logprobs
+        if not num_top_logprobs:
+            return turn
+        ids = [[t + j for j in range(num_top_logprobs)] for t in turn.output_ids]
+        head = TopLogprobs(ids=ids, logprobs=[[-1.0] * num_top_logprobs for _ in ids])
+        return dataclasses.replace(turn, output_top_logprobs=head)
 
 
 def make_gateway(replies: list[str], **gateway_kwargs) -> tuple[RolloutGateway, FakeBackend]:
@@ -147,6 +170,57 @@ async def test_close_during_async_render_does_not_generate(history_mode):
 # ---------------------------------------------------------------------------
 # full lifecycle: OpenAI tool-calling loop -> one CLEAN TraceRecord
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, "linear", "tree"], ids=["default", "linear", "tree"])
+@pytest.mark.parametrize("second_protocol", ["openai", "anthropic"])
+async def test_history_mode_preserves_served_tokens_on_replay(mode, second_protocol):
+    """An echoed assistant message changes tokens when rendered again: defaults heal
+    it before sampling; explicitly selecting tree keeps the full replay and forks."""
+
+    class DriftingRenderer(FakeRenderer):
+        async def render(self, messages, **kwargs):
+            replayed = [
+                {**m, "content": (m.get("content") or "").lower()} if m["role"] == "assistant" else m for m in messages
+            ]
+            return await super().render(replayed, **kwargs)
+
+    renderer = DriftingRenderer()
+    backend = FakeBackend(renderer, ["RAW answer", "second answer"])
+    gateway = RolloutGateway(
+        backend=backend, renderer=renderer, tokenizer=renderer, **({"history_mode": mode} if mode else {})
+    )
+    assert all(adapter.healer is gateway.healer for adapter in gateway.adapters)
+    assert (gateway.healer is None) == (mode == "tree")
+    sid = "replayed-history"
+    messages = [{"role": "user", "content": "question"}]
+    async with serve(gateway) as client:
+        gateway.create_session(sid)
+        first = await client.post(
+            "/v1/chat/completions", json={"model": "m", "messages": messages}, headers=bearer(sid)
+        )
+        assert first.status == 200
+        reply = (await first.json())["choices"][0]["message"]
+        messages += [reply, {"role": "user", "content": "continue"}]
+        route = "/v1/chat/completions" if second_protocol == "openai" else "/v1/messages"
+        second = await client.post(
+            route, json={"model": "m", "messages": messages, "max_tokens": 32}, headers=bearer(sid)
+        )
+        assert second.status == 200
+        records = await gateway.finish_session(sid, reward=1.0)
+
+    served = backend.calls[0]["prompt_ids"] + renderer._encode("RAW answer")
+    extends_served = backend.calls[1]["prompt_ids"][: len(served)] == served
+    assert extends_served == (mode != "tree")
+    assert len(records) == (2 if mode == "tree" else 1)
+    trained, logprobs = [], []
+    for record in records:
+        tail = record.token_ids[-record.response_length :]
+        trained.extend(t for t, mask in zip(tail, record.loss_mask, strict=True) if mask)
+        logprobs.extend(p for p, mask in zip(record.logprobs, record.loss_mask, strict=True) if mask)
+    assert trained == renderer._encode("RAW answer second answer")
+    assert logprobs == [-0.5] * len(trained)
 
 
 @pytest.mark.asyncio
@@ -216,9 +290,9 @@ async def test_openai_tool_loop_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_linear_mode_attaches_healer_stats_to_metadata():
+async def test_healed_mode_attaches_healer_stats_to_metadata():
     """In linear mode, the session's LinearHealer counters ride out on every record's
-    metadata under ``linear_healer`` (the metrics seam), alongside caller extra_metadata."""
+    metadata under ``healer`` (the metrics seam), alongside caller extra_metadata."""
     gateway, backend = make_gateway(replies=["CALL calculator expr=2+2", "the answer is 4"], history_mode="linear")
     tools = [{"type": "function", "function": {"name": "calculator", "parameters": {"type": "object"}}}]
     sid = "ep-lin:solver"
@@ -241,12 +315,50 @@ async def test_linear_mode_attaches_healer_stats_to_metadata():
         await client.post("/v1/chat/completions", json=body2, headers=bearer(sid))
         records = await gateway.finish_session(sid, reward=1.0, extra_metadata={"task": "math"})
 
-    assert len(records) == 1  # linear mode stays CLEAN -> one row
+    assert len(records) == 1  # append-only history stays CLEAN -> one row
     md = records[0].metadata
     assert md["task"] == "math"  # caller metadata preserved
-    # turn 2 was healed (prior state exists); the per-session counter is surfaced.
+    # turn 2 was healed on turn 1; the per-session counter is surfaced.
     assert md["linear_healer"]["healed_turns"] == 1
-    assert md["linear_healer"].get("nonlinear", 0) == 0
+    assert md["linear_healer"]["nonlinear"] == 0
+
+
+@pytest.mark.asyncio
+async def test_healed_mode_heals_retry_branch():
+    """In linear mode a retried turn anchors on the turn it extends: both attempts become
+    CLEAN branches."""
+    gateway, backend = make_gateway(
+        replies=["CALL calculator expr=2+2", "the answer is 4", "it is 4"], history_mode="linear"
+    )
+    tools = [{"type": "function", "function": {"name": "calculator", "parameters": {"type": "object"}}}]
+    sid = "ep-tree:solver"
+
+    async with serve(gateway) as client:
+        gateway.create_session(sid)
+        body1 = {"model": "m", "messages": [{"role": "user", "content": "two plus two"}], "tools": tools}
+        resp1 = await client.post("/v1/chat/completions", json=body1, headers=bearer(sid))
+        choice1 = (await resp1.json())["choices"][0]
+        call = choice1["message"]["tool_calls"][0]
+        body2 = {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "two plus two"},
+                {"role": "assistant", "content": None, "tool_calls": choice1["message"]["tool_calls"]},
+                {"role": "tool", "tool_call_id": call["id"], "content": "4"},
+            ],
+            "tools": tools,
+        }
+        await client.post("/v1/chat/completions", json=body2, headers=bearer(sid))
+        await client.post("/v1/chat/completions", json=body2, headers=bearer(sid))  # retry turn 2
+        records = await gateway.finish_session(sid, reward=1.0)
+
+    turn1 = backend.calls[0]["prompt_ids"] + gateway.renderer._encode("CALL calculator expr=2+2")
+    assert backend.calls[1]["prompt_ids"] == backend.calls[2]["prompt_ids"]
+    assert backend.calls[1]["prompt_ids"][: len(turn1)] == turn1
+    assert len(records) == 2  # one CLEAN record per branch
+    stats = records[0].metadata["linear_healer"]
+    assert stats["healed_turns"] == 2
+    assert stats["nonlinear"] == 1  # the retry
 
 
 # ---------------------------------------------------------------------------
@@ -462,12 +574,8 @@ async def test_max_context_tokens_returns_context_window_error():
         )
         assert backend.calls == []  # backend never invoked
 
-        # the refusal is flagged per session, readable until the session is drained
-        assert gateway.context_exhausted(sid)
-        assert not gateway.context_exhausted("ep7:other")
         # a rejected input is not part of the trajectory
         assert await gateway.finish_session(sid) == []
-        assert not gateway.context_exhausted(sid)
 
 
 @pytest.mark.asyncio
@@ -485,8 +593,32 @@ async def test_anthropic_max_context_tokens_returns_context_window_error():
         assert error["error"]["type"] == "invalid_request_error"
         assert "maximum context length is 2 tokens" in error["error"]["message"]
         assert backend.calls == []
-        assert gateway.context_exhausted(sid)  # flagged on whichever adapter refused it
         assert await gateway.finish_session(sid) == []
+
+
+@pytest.mark.asyncio
+async def test_backend_min_new_tokens_treats_small_room_as_context_window_error():
+    """A backend floor (SageMaker: maxTokens >= 512) makes room below it count as exhausted."""
+    gateway, backend = make_gateway(replies=["hello"])
+    backend.min_new_tokens = 4
+    sid = "ep7:floor"
+
+    async with serve(gateway) as client:
+        # prompt renders to 3 ids: a budget of 6 leaves 3 < 4 tokens of room
+        gateway.create_session(sid, max_context_tokens=6)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        resp = await client.post("/v1/chat/completions", json=body, headers=bearer(sid))
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "context_length_exceeded"
+        assert backend.calls == []
+
+        # a budget of 7 leaves exactly the floor: sampled, clamped to the room left
+        sid2 = "ep7:floor-ok"
+        gateway.create_session(sid2, max_context_tokens=7)
+        resp = await client.post("/v1/chat/completions", json=body, headers=bearer(sid2))
+        assert resp.status == 200
+        (call,) = backend.calls
+        assert call["sampling_params"]["max_new_tokens"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -547,3 +679,62 @@ async def test_adapter_subset_mounts_only_requested_routes():
         assert resp.status == 200
         resp = await client.post("/v1/messages", json=body, headers=bearer("s"))
         assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_top_logprobs_follow_trained_tokens():
+    renderer = FakeRenderer()
+    backend = FakeTopLogprobsBackend(renderer, ["first reply", "second reply"])
+    gateway = RolloutGateway(backend=backend, renderer=renderer, tokenizer=renderer)
+    sid = "ep1"
+
+    async with serve(gateway) as client:
+        gateway.create_session(sid, num_top_logprobs=3)
+        messages = [{"role": "user", "content": "hi"}]
+        for _ in range(2):
+            resp = await client.post(
+                "/v1/chat/completions", json={"model": "m", "messages": messages}, headers=bearer(sid)
+            )
+            assert resp.status == 200
+            reply = (await resp.json())["choices"][0]["message"]
+            messages = messages + [reply, {"role": "user", "content": "more"}]
+        (rec,) = await gateway.finish_session(sid, base_sample=BaseTrace(rollout_id=sid))
+
+    assert [call["num_top_logprobs"] for call in backend.calls] == [3, 3]
+    response = rec.token_ids[-rec.response_length :]
+    covered = {}
+    for offset, head in rec.top_logprobs:
+        for i, row in enumerate(head.ids):
+            covered[offset + i] = row
+    # exactly the trained tokens carry a head, each from that token's own position
+    assert sorted(covered) == [i for i, m in enumerate(rec.loss_mask) if m]
+    assert all(row == [response[i] + j for j in range(3)] for i, row in covered.items())
+
+
+def test_top_logprobs_need_a_capable_backend():
+    gateway, _ = make_gateway(replies=[])
+    with pytest.raises(ValueError, match="FakeBackend cannot return top logprobs"):
+        gateway.create_session("s", num_top_logprobs=2)
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages"])
+@pytest.mark.asyncio
+async def test_rejected_sampling_params_fail_the_turn_before_generation(path):
+    gateway, backend = make_gateway(replies=["unused"])
+    seen = []
+
+    def validate(params):
+        seen.append(params)
+        if params.get("temperature") != 1.0:
+            raise ValueError("temperature must be 1.0")
+
+    body = {"model": "m", "max_tokens": 16, "temperature": 0.5, "messages": [{"role": "user", "content": "hi"}]}
+    async with serve(gateway) as client:
+        gateway.create_session("s", sampling_defaults={"temperature": 1.0}, validate_sampling_params=validate)
+        resp = await client.post(path, json=body, headers=bearer("s"))
+        assert resp.status == 400
+        assert "temperature must be 1.0" in json.dumps(await resp.json())
+        resp = await client.post(path, json={**body, "temperature": 1.0}, headers=bearer("s"))
+        assert resp.status == 200
+    assert [p["temperature"] for p in seen] == [0.5, 1.0]  # the merged params, after the agent's override
+    assert len(backend.calls) == 1

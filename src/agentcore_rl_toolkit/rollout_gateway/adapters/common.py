@@ -27,7 +27,7 @@ from typing import Any
 
 from aiohttp import web
 
-from ..linear import LinearHealer
+from ..linear import LinearHealer, make_healer
 from ..render import Renderer
 from ..sampling_backends.base import SamplingBackend
 from ..trace import BaseTrace, TraceRecord
@@ -41,15 +41,13 @@ class Session:
     """Per-sid adapter state: sampling defaults and context budget.
 
     Trajectory state lives in the shared TrajectoryManager (BaseAdapter.manager),
-    not here. ``context_exhausted`` is set once this adapter answered a turn with
-    a context-limit error (the prompt filled ``max_context_tokens``), so a caller
-    can tell a model-caused failure from an infrastructure one without matching
-    error text.
+    not here.
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
-    context_exhausted: bool = False
+    num_top_logprobs: int = 0
+    validate_sampling_params: Callable[[dict], None] | None = None
 
 
 @dataclasses.dataclass
@@ -150,7 +148,7 @@ class BaseAdapter:
         renderer: Renderer,
         tokenizer=None,
         max_turns_per_sid: int | None = None,
-        history_mode: str = "tree",
+        history_mode: str = "linear",
         linear_on_nonlinear: str = "reset",
         healer: LinearHealer | None = None,
         debug_callback: Callable[..., None] | None = None,
@@ -166,9 +164,9 @@ class BaseAdapter:
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
-        # opt-in auth guard: when True, only sids pre-registered via open_session
+        # Opt-in auth guard: when True, only sids registered via open_session
         # (<- RolloutGateway.create_session) may drive a turn; an unknown Bearer is
-        # refused with 401 instead of implicitly creating a session. Default False
+        # refused with 401 instead of implicitly opening a session. Default False
         # keeps the open-session-on-first-turn behaviour (local runs, tests).
         self.require_registered_sessions = require_registered_sessions
 
@@ -179,16 +177,12 @@ class BaseAdapter:
         else:
             self.manager = TrajectoryManager()
 
-        # linear-history mode: heal re-tokenization drift at generation time so the
-        # manager stays permanently CLEAN (one sample per session). See linear.py.
-        # A shared healer may be injected (co-mounted adapters
-        # share canonical state, like the manager); else built here when requested.
-        if healer is not None:
-            self.healer: LinearHealer | None = healer
-        elif history_mode == "linear":
-            self.healer = LinearHealer(renderer, on_nonlinear=linear_on_nonlinear)
-        else:
-            self.healer = None
+        # linear-history mode: heal re-tokenization drift at generation time so every
+        # branch of the manager's tree stays CLEAN. See linear.py. A shared healer may be
+        # injected (co-mounted adapters share it, like the manager); else built here.
+        self.healer: LinearHealer | None = (
+            healer if healer is not None else make_healer(history_mode, renderer, self.manager, linear_on_nonlinear)
+        )
 
         self.debug_callback: Callable[..., None] | None = debug_callback
         # per-sid turn cap: return 429 to kill the run once exceeded
@@ -227,6 +221,10 @@ class BaseAdapter:
         """Return this protocol's response when the input fills its context window."""
         raise NotImplementedError
 
+    def _invalid_request_error(self, message: str) -> web.Response:
+        """Return this protocol's HTTP 400 response for a request the session rejects."""
+        raise NotImplementedError
+
     async def _respond(
         self,
         request: web.Request,
@@ -246,6 +244,8 @@ class BaseAdapter:
         *,
         sampling_defaults: dict | None = None,
         max_context_tokens: int = 0,
+        num_top_logprobs: int = 0,
+        validate_sampling_params: Callable[[dict], None] | None = None,
     ) -> None:
         """Register a fresh per-sid Session; sids must be unique."""
         if sid in self.store:
@@ -253,6 +253,8 @@ class BaseAdapter:
         self.store[sid] = Session(
             sampling_defaults=dict(sampling_defaults or {}),
             max_context_tokens=int(max_context_tokens or 0),
+            num_top_logprobs=num_top_logprobs,
+            validate_sampling_params=validate_sampling_params,
         )
 
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
@@ -381,10 +383,8 @@ class BaseAdapter:
         if sid in self.closed:  # session drained; refuse stragglers
             self.logger.debug("[%s] sid=%s request after session closed", self.log_prefix, sid)
             return web.Response(status=503, text="session closed")
-        # opt-in auth: refuse turns for sids that were never registered via
-        # create_session. open_session populates self.store, so an unregistered
-        # sid is simply one absent from it. Debug-level log to avoid flooding on a
-        # scanner hammering the port.
+        # open_session populates self.store, so an unregistered sid is one absent from
+        # it. Debug-level log so a scanner hammering the port does not flood the logs.
         if self.require_registered_sessions and sid not in self.store:
             self.logger.debug("[%s] sid=%s rejected: unregistered session", self.log_prefix, sid)
             return web.Response(status=401, text="unknown session")
@@ -399,8 +399,8 @@ class BaseAdapter:
         try:
             translated, tools_schema = self._translate(body)
             if self.healer is not None:
-                # linear mode: splice canonical served ids over the drifted re-render
-                # before generation (the healer does the render internally).
+                # linear mode: splice served ids over the drifted re-render before
+                # generation (the healer does the render internally).
                 prompt_ids = await self.healer.heal(sid, translated, tools_schema)
             else:
                 prompt_ids = await self.renderer.render(
@@ -412,22 +412,31 @@ class BaseAdapter:
             if sid in self.closed:
                 return web.Response(status=503, text="session closed")
             sampling_params = _sampling_params(s, body, max_token_keys=self.max_token_keys, stop_keys=self.stop_keys)
-            # Context-budget clamp (backend-neutral): an input that fills the
-            # per-sid budget cannot generate even one token. Report that as an
-            # input-context error, rather than fabricating a zero-token,
-            # length-capped completion that clients cannot distinguish from a
-            # normal empty model response.
+            if s.validate_sampling_params is not None:
+                try:
+                    s.validate_sampling_params(dict(sampling_params))
+                except ValueError as e:
+                    self.logger.warning("[%s] sid=%s rejected sampling params: %s", self.log_prefix, sid, e)
+                    return self._invalid_request_error(str(e))
+            generate_kwargs = {"num_top_logprobs": s.num_top_logprobs} if s.num_top_logprobs else {}
+            # Context-budget clamp (backend-neutral): an input that leaves less room
+            # than the backend can sample (1 token, or a backend-declared
+            # ``min_new_tokens`` floor) is an input-context error, rather than a
+            # fabricated zero-token, length-capped completion that clients cannot
+            # distinguish from a normal empty model response.
             if s.max_context_tokens > 0:
                 remaining = s.max_context_tokens - len(prompt_ids)
-                if remaining <= 0:
+                min_new_tokens = getattr(self.backend, "min_new_tokens", 1)
+                if remaining < min_new_tokens:
                     self.logger.warning(
-                        "[%s] sid=%s prompt fills max_context_tokens (%d >= %d)",
+                        "[%s] sid=%s prompt leaves %d < %d tokens of max_context_tokens=%d (prompt=%d)",
                         self.log_prefix,
                         sid,
-                        len(prompt_ids),
+                        remaining,
+                        min_new_tokens,
                         s.max_context_tokens,
+                        len(prompt_ids),
                     )
-                    s.context_exhausted = True
                     return self._context_limit_error(
                         prompt_tokens=len(prompt_ids),
                         max_context_tokens=s.max_context_tokens,
@@ -437,14 +446,14 @@ class BaseAdapter:
                         int(sampling_params.get("max_new_tokens", remaining)), remaining
                     )
                     turn = await self.backend.generate(
-                        prompt_ids=prompt_ids, sampling_params=sampling_params, session_id=sid
+                        prompt_ids=prompt_ids, sampling_params=sampling_params, session_id=sid, **generate_kwargs
                     )
             else:
                 turn = await self.backend.generate(
-                    prompt_ids=prompt_ids, sampling_params=sampling_params, session_id=sid
+                    prompt_ids=prompt_ids, sampling_params=sampling_params, session_id=sid, **generate_kwargs
                 )
 
-            parsed = self.renderer.parse(turn.output_ids, tools_schema=tools_schema)
+            parsed = self.renderer.parse(turn.output_ids, finish_reason=turn.finish_reason, tools_schema=tools_schema)
             reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
@@ -476,25 +485,15 @@ class BaseAdapter:
                 turn,
             )
 
-            # advance linear-mode canonical state in lockstep with record_turn (only on
-            # turns we actually record — the disconnect path above returned early). Uses
-            # turn.prompt_ids so the healer's state matches exactly what the manager saw.
-            if self.healer is not None:
-                self.healer.commit(
-                    sid,
-                    fed_prompt_ids=turn.prompt_ids,
-                    output_ids=turn.output_ids,
-                    messages=translated,
-                    response_message=reply.manager_message,
-                    tools=tools_schema,
-                )
-
+            # Only turns the client received are recorded (the disconnect path above
+            # returned early); in linear mode they are what later requests anchor on.
             self.manager.record_turn(
                 sid,
                 turn=turn,
                 prompt_messages=translated,
                 response_message=reply.manager_message,
                 metadata={"sid": sid},
+                tools=tools_schema,
             )
             return response
         finally:

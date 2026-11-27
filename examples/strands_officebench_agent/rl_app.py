@@ -12,12 +12,12 @@ from strands_tools import shell
 from tools import ALL_TOOLS
 from utils import load_task_from_s3, setup_testbed
 
-from agentcore_rl_toolkit import AgentCoreRLApp
+from agentcore_rl_toolkit import AgentCoreRuntimeApp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = AgentCoreRLApp()
+app = AgentCoreRuntimeApp()
 
 load_dotenv()
 
@@ -36,20 +36,9 @@ SYSTEM_PROMPT = (
 reward_fn = OfficeBenchReward()
 
 
-def _response_text(message: dict | None) -> str:
-    """The text of the agent's final message, or "" when it has no text block.
-
-    The final message can legitimately carry empty content or only non-text blocks,
-    so this never indexes into it: a logging line must not keep the reward from
-    being computed for a task the agent may well have completed.
-    """
-    content = (message or {}).get("content") or []
-    return "".join(block.get("text", "") for block in content if isinstance(block, dict))
-
-
-@app.rollout_entrypoint
+@app.entrypoint
 def invoke_agent(payload: dict):
-    rollout_config = payload.get("_rollout", {})
+    rollout_config = payload.get("_config", {})
     api_key = rollout_config.get("api_key") or "EMPTY"
 
     # Choose model based on config
@@ -62,7 +51,7 @@ def invoke_agent(payload: dict):
     else:
         sampling = rollout_config.get("sampling_params", {})
         bedrock_kwargs = {
-            "model_id": rollout_config.get("model_id", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "model_id": rollout_config.get("model_id", "us.anthropic.claude-sonnet-5-5"),
             "temperature": sampling.get("temperature"),
             "top_p": sampling.get("top_p"),
             "max_tokens": sampling.get("max_tokens"),
@@ -106,7 +95,11 @@ def invoke_agent(payload: dict):
     logger.info(f"Task: {user_input}")
 
     response = agent(user_input)
-    logger.info(f"Agent response: {_response_text(response.message)}")
+    # Join the text blocks instead of indexing content[0]: with thinking on (the default
+    # on Claude Sonnet 5.5), Strands surfaces a leading reasoningContent block.
+    content = response.message.get("content") or []
+    response_text = "".join(block["text"] for block in content if "text" in block)
+    logger.info(f"Agent response: {response_text}")
 
     # Collect full conversation history
     messages = [{"role": msg.get("role", "unknown"), "content": msg.get("content", [])} for msg in agent.messages]
@@ -120,7 +113,7 @@ def invoke_agent(payload: dict):
 
     return {
         "messages": messages,
-        "rewards": reward,
+        "reward": reward,
     }
 
 

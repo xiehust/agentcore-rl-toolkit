@@ -1,5 +1,4 @@
 import copy
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -8,26 +7,19 @@ from constants import (
     ASSISTANT_INSTRUCTION,
     ASSISTANT_MODEL_DEFAULTS,
     ASSISTANT_SYSTEM_PROMPT,
-    DOMAINS_USER_TOOLS,
     MALFORMED_TOOL_CALL_TAGS,
     ORCHESTRATOR_CONFIG,
-    TERMINATION_KEYWORDS,
-    USER_MODEL_CONFIG,
-    USER_SYSTEM_PROMPT,
 )
 from reward import TauBenchReward
-from strands import Agent
-from strands.agent.conversation_manager import NullConversationManager
-from strands.models import BedrockModel
 from strands.models.openai import OpenAIModel
 from tau2.data_model.tasks import EnvFunctionCall
 from tau2.domains.airline.environment import get_environment as airline_env
 from tau2.domains.retail.environment import get_environment as retail_env
 from tau2.domains.telecom.environment import get_environment_workflow_policy as telecom_env
-from tau2.user.user_simulator import get_global_user_sim_guidelines
-from utils import extract_text, log_turn, make_strands_tool, to_real_world_roles
+from user_simulator import TauBenchUserSimulator, UserSimulator
+from utils import extract_text, make_strands_tool, run_agent_turn, to_real_world_roles
 
-from agentcore_rl_toolkit import AgentCoreRLApp
+from agentcore_rl_toolkit import AgentCoreRuntimeApp
 
 GET_ENVIRONMENT_FUNC = {
     "airline": airline_env,
@@ -37,7 +29,7 @@ GET_ENVIRONMENT_FUNC = {
 
 logger = logging.getLogger(__name__)
 
-app = AgentCoreRLApp()
+app = AgentCoreRuntimeApp()
 
 
 # ---------------------------------------------------------------------------
@@ -55,33 +47,32 @@ class RolloutContext:
     task: dict
     domain: str
     assistant_model: Any
-    user_model: Any
+    user_simulator: UserSimulator
     env: Any
     assistant_tools: list
-    user_tools: list
     assistant_system_prompt: str
-    user_system_prompt: str
 
 
 def _setup_rollout(payload: dict) -> RolloutContext:
     """Assemble everything a rollout needs from the request payload.
 
-    Parses model/task config, instantiates the assistant (vLLM) and user
-    (Bedrock) models, builds a fresh environment and replays its initialization
-    actions, wraps tau-bench tools as Strands tools, and renders system prompts.
+    Parses model/task config, instantiates the assistant (vLLM) model, builds a
+    fresh environment and replays its initialization actions, wraps tau-bench
+    assistant tools as Strands tools, renders the assistant system prompt, and
+    builds the user simulator (Bedrock), reset onto this task and environment.
 
     Args:
-        payload: The rollout request, with a "_rollout" block (base_url, model_id,
+        payload: The rollout request, with a "_config" block (base_url, model_id,
             optional sampling_params) and a "_task" block (domain, user_scenario,
             initial_state, evaluation_criteria, ...).
 
     Returns:
         A populated ``RolloutContext``.
     """
-    base_url = payload["_rollout"]["base_url"]
-    model_id = payload["_rollout"]["model_id"]
+    base_url = payload["_config"]["base_url"]
+    model_id = payload["_config"]["model_id"]
     # Copy so we don't mutate the caller's payload while applying defaults.
-    params = copy.deepcopy(payload["_rollout"].get("sampling_params", {}))
+    params = copy.deepcopy(payload["_config"].get("sampling_params", {}))
     for k, v in ASSISTANT_MODEL_DEFAULTS.items():
         if k == "extra_body":
             params.setdefault("extra_body", {})
@@ -92,7 +83,7 @@ def _setup_rollout(payload: dict) -> RolloutContext:
 
     task = payload["_task"]
     domain = task["domain"]
-    api_key = payload["_rollout"].get("api_key") or "EMPTY"
+    api_key = payload["_config"].get("api_key") or "EMPTY"
 
     # Assistant model (RL-trained, served via vLLM)
     assistant_model = OpenAIModel(
@@ -101,44 +92,24 @@ def _setup_rollout(payload: dict) -> RolloutContext:
         params=params,
     )
 
-    # User simulator model (Bedrock)
-    _user_cfg = USER_MODEL_CONFIG["bedrock"]
-    user_model = BedrockModel(
-        model_id=_user_cfg["model_id"],
-        temperature=_user_cfg["temperature"],
-        max_tokens=_user_cfg["max_tokens"],
-        additional_request_fields={
-            "thinking": (
-                {"type": "enabled", "budget_tokens": _user_cfg.get("thinking_budget", 1024)}
-                if _user_cfg["thinking_enabled"]
-                else {"type": "disabled"}
-            )
-        },
-    )
-
     # Fresh environment + initialize state
     env = GET_ENVIRONMENT_FUNC[domain]()
     initial_state = task.get("initial_state") or {}
     for action in initial_state.get("initialization_actions") or []:
         env.run_env_function_call(EnvFunctionCall(**action))
 
-    # Wrap tau-bench tools as Strands tools
+    # Wrap tau-bench assistant tools as Strands tools
     assistant_tools = [make_strands_tool(env, t.name, t, "assistant") for t in env.get_tools()]
-    user_tools = (
-        [make_strands_tool(env, t.name, t, "user") for t in env.get_user_tools()]
-        if domain in DOMAINS_USER_TOOLS
-        else []
-    )
 
-    # System prompts
+    # Assistant system prompt
     assistant_system_prompt = ASSISTANT_SYSTEM_PROMPT.format(
         assistant_instruction=ASSISTANT_INSTRUCTION,
         assistant_policy=env.get_policy(),
     )
-    user_system_prompt = USER_SYSTEM_PROMPT.format(
-        global_user_sim_guidelines=get_global_user_sim_guidelines(use_tools=(domain in DOMAINS_USER_TOOLS)),
-        instructions=json.dumps(task["user_scenario"]),
-    )
+
+    # User simulator (Bedrock); reset binds its prompt and user tools to this task and env
+    user_simulator = TauBenchUserSimulator()
+    user_simulator.reset(task, env)
 
     return RolloutContext(
         base_url=base_url,
@@ -147,50 +118,11 @@ def _setup_rollout(payload: dict) -> RolloutContext:
         task=task,
         domain=domain,
         assistant_model=assistant_model,
-        user_model=user_model,
+        user_simulator=user_simulator,
         env=env,
         assistant_tools=assistant_tools,
-        user_tools=user_tools,
         assistant_system_prompt=assistant_system_prompt,
-        user_system_prompt=user_system_prompt,
     )
-
-
-def _run_agent_turn(
-    turn: int, role: str, global_messages: list[dict], model: Any, tools: list, system_prompt: str
-) -> Any:
-    """Run one ReAct turn for the given agent and record its output.
-
-    Builds an ``Agent`` from ``role``'s perspective of the shared history, runs a
-    single turn, then tags every newly produced message with ``from=role`` and
-    appends it to ``global_messages`` (mutated in place).
-
-    Args:
-        turn: Zero-based turn index (for logging).
-        role: Which agent acts this turn — "user" or "assistant".
-        global_messages: The shared conversation history; appended to in place.
-        model: The Strands model backing this agent.
-        tools: Tools available to this agent.
-        system_prompt: System prompt for this agent.
-
-    Returns:
-        The Strands ``AgentResult`` for the turn (its ``.message`` holds the reply).
-    """
-    messages = log_turn(turn, role, global_messages, ORCHESTRATOR_CONFIG)
-    agent = Agent(
-        model=model,
-        tools=tools,
-        system_prompt=system_prompt,
-        messages=messages,
-        conversation_manager=NullConversationManager(),  # avoid context moving window of 40 turns
-    )
-    logger.debug("%s MESSAGE RAW:\n%s", role.upper(), json.dumps(agent.messages, indent=4))
-    prev_len = len(agent.messages)
-    response = agent()
-    for m in agent.messages[prev_len:]:
-        m["from"] = role
-        global_messages.append(m)
-    return response
 
 
 def _run_conversation(ctx: RolloutContext) -> tuple[list[dict], Optional[float], Optional[str]]:
@@ -201,7 +133,8 @@ def _run_conversation(ctx: RolloutContext) -> tuple[list[dict], Optional[float],
     reached.
 
     Args:
-        ctx: The rollout context holding both models, tools, and system prompts.
+        ctx: The rollout context holding the assistant model, tools, system
+            prompt, and the user simulator.
 
     Returns:
         A tuple ``(global_messages, force_reward, terminated_reason)``:
@@ -221,19 +154,16 @@ def _run_conversation(ctx: RolloutContext) -> tuple[list[dict], Optional[float],
 
     for turn in range(ORCHESTRATOR_CONFIG.get("max_turns", 50)):
         # --- User turn ---
-        user_response = _run_agent_turn(
-            turn, "user", global_messages, ctx.user_model, ctx.user_tools, ctx.user_system_prompt
-        )
-        user_text = extract_text(user_response.message)
-        hit = next((kw for kw in TERMINATION_KEYWORDS if kw in user_text), None)
-        if hit:
-            terminated_reason = hit
-            logger.info("Terminated at turn %d: %s", turn, hit)
+        user_turn = ctx.user_simulator.step(global_messages)
+        global_messages.extend(user_turn.messages)
+        if user_turn.terminated:
+            terminated_reason = user_turn.termination_reason
+            logger.info("Terminated at turn %d: %s", turn, terminated_reason)
             break
 
         # --- Assistant turn ---
         try:
-            _run_agent_turn(
+            _, assistant_messages = run_agent_turn(
                 turn,
                 "assistant",
                 global_messages,
@@ -244,6 +174,7 @@ def _run_conversation(ctx: RolloutContext) -> tuple[list[dict], Optional[float],
         except Exception as e:
             logger.warning("Agent failed (%s), partial rollout, reward=0", e)
             raise
+        global_messages.extend(assistant_messages)
 
         # Check for malformed tool-call tags leaking into the assistant's text
         combined_text = extract_text(global_messages[-1]).strip()
@@ -262,14 +193,14 @@ def _run_conversation(ctx: RolloutContext) -> tuple[list[dict], Optional[float],
 # ---------------------------------------------------------------------------
 
 
-@app.rollout_entrypoint
+@app.entrypoint
 def invoke_agent(payload: dict) -> dict:
     """Run one tau2-bench rollout and return its results.
 
     Sets up the rollout, drives the user/assistant conversation, computes the
     reward, and returns the reward, conversation, and metadata. Used as the
-    ``@rollout_entrypoint``, which automatically runs this in the background,
-    saves the returned dict to S3, and records errors for the client.
+    ``@app.entrypoint``; the HTTP client requests background execution and
+    retrieves the result through the Runtime start/get protocol.
 
     The training gateway captures token IDs for this rollout.
 
@@ -277,9 +208,9 @@ def invoke_agent(payload: dict) -> dict:
         payload: The rollout request (see ``_setup_rollout`` for the schema).
 
     Returns:
-        A JSON-serializable dict with keys: "rewards", "reward_info",
+        A JSON-serializable dict with keys: "reward", "reward_info",
         "messages", and "meta". On assistant failure, a minimal
-        ``{"rewards": 0.0}`` partial result.
+        ``{"reward": 0.0}`` partial result.
     """
     ctx = _setup_rollout(payload)
     logger.info("Starting rollout: domain=%s, model=%s", ctx.domain, ctx.model_id)
@@ -290,7 +221,7 @@ def invoke_agent(payload: dict) -> dict:
         global_messages, force_reward, terminated_reason = _run_conversation(ctx)
     except Exception:
         logger.exception("Rollout failed before completion")
-        return {"rewards": 0.0}
+        return {"reward": 0.0}
 
     # Compute reward
     if force_reward is not None:
@@ -307,7 +238,7 @@ def invoke_agent(payload: dict) -> dict:
     )
 
     return {
-        "rewards": rewards,
+        "reward": rewards,
         "reward_info": reward_info,
         "messages": to_real_world_roles(global_messages),
         "meta": {
@@ -316,10 +247,7 @@ def invoke_agent(payload: dict) -> dict:
                 "model_id": ctx.model_id,
                 "params": ctx.params,
             },
-            "user_model": {
-                "source": "bedrock",
-                **USER_MODEL_CONFIG["bedrock"],
-            },
+            "user_model": ctx.user_simulator.describe(),
             "terminated_reason": terminated_reason,
         },
     }

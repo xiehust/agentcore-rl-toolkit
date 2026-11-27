@@ -18,13 +18,12 @@
 #   1. Deploy examples/strands_math_agent/rl_app.py to AgentCore Runtime
 #      (see that example's README) and export:
 #        export AGENT_RUNTIME_ARN=arn:aws:bedrock-agentcore:...:runtime/...
-#        export ACR_S3_BUCKET=your-s3-bucket
 #   2. ACR containers must be able to reach this host on the gateway port
 #      (auto-assigned; open the trainer CPU nodes' ports to ACR egress).
 #   3. python preprocess_gsm8k.py --output-dir gsm8k   (once)
 #
 # Tool-call parsing happens in the rollout gateway's renderer, auto-detected from
-# the model's chat template (rollout_gateway/response_schemas.py) — engine-level
+# the model's chat template (rollout_gateway/response_templates.py) — engine-level
 # parser flags (vllm tool_call_parser etc.) have no effect on this token-in/token-out
 # path and are deliberately not set.
 #

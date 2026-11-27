@@ -7,9 +7,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Preparing an Agent for RL training is straightforward. The
 side-by-side below shows a deployed Bedrock AgentCore agent and the
-RL-adapted version — all four
-[examples](https://github.com/awslabs/agentcore-rl-toolkit/tree/main/examples) in this repo
-(math, AppWorld, migration, OfficeBench) follow this pattern.
+RL-adapted version using `AgentCoreRuntimeApp`.
 
 ## Before vs After
 
@@ -30,7 +28,7 @@ app = BedrockAgentCoreApp()
 
 @app.entrypoint
 def invoke_agent(payload):
-    model = BedrockModel(model_id="us.anthropic.claude-sonnet-4-20250514-v1:0")
+    model = BedrockModel(model_id="us.anthropic.claude-sonnet-5-5")
     agent = Agent(
         model=model,
         tools=[calculator],
@@ -39,7 +37,9 @@ def invoke_agent(payload):
 
     user_input = payload.get("prompt")
     response = agent(user_input)
-    return response.message["content"][0]["text"]
+    # Skip the leading reasoningContent block from adaptive thinking.
+    content = response.message.get("content") or []
+    return "".join(block["text"] for block in content if "text" in block)
 
 
 if __name__ == "__main__":
@@ -49,32 +49,26 @@ if __name__ == "__main__":
   </TabItem>
   <TabItem label="After — adapted for RL">
 
-Added/changed lines to support Agentic RL are highlighted. Everything else — tools, system
-prompt, and agent logic — are unchanged.
+The tools, system prompt, and agent logic stay the same.
 
 
-```python ins={7-8,11-14,16-24,33-41}
-from agentcore_rl_toolkit import AgentCoreRLApp
+```python
+from agentcore_rl_toolkit import AgentCoreRuntimeApp
 from strands import Agent
 from strands.models.openai import OpenAIModel
 from strands_tools import calculator
 from reward import MyReward
 
-app = AgentCoreRLApp()
+app = AgentCoreRuntimeApp()
 reward_fn = MyReward()
 
 
-# Switches handler from "return text sync" to "fire-and-forget, persist
-# the result." Without it the trainer can't receive rollout artifacts
-# after the HTTP call returns.
-@app.rollout_entrypoint
+@app.entrypoint
 def invoke_agent(payload: dict):
-    # Training backend injects _rollout per request so each rollout
-    # can target a different inference endpoint (vLLM/SGLang serving
-    # the *current* policy weights, not a non-trainable model API).
-    cfg = payload["_rollout"]
+    # Configure the model endpoint at runtime via the invocation payload.
+    cfg = payload["_config"]
     model = OpenAIModel(
-        client_args={"api_key": "EMPTY", "base_url": cfg["base_url"]},
+        client_args={"api_key": cfg.get("api_key") or "EMPTY", "base_url": cfg["base_url"]},
         model_id=cfg["model_id"],
         params=cfg.get("sampling_params", {}),
     )
@@ -86,15 +80,13 @@ def invoke_agent(payload: dict):
 
     response = agent(payload["prompt"])
 
-    # reward_fn is a callable with flexible input — pass whatever
-    # context it needs (response text, ground truth, env state, etc.).
-    # Return a dict: RL needs a scalar (or per-turn vector) signal.
-    # `rewards` is the key training backends read.
-    rewards = reward_fn(
-        response_text=response.message["content"][0]["text"],
+    # Compute a scalar reward.
+    content = response.message.get("content") or []
+    reward = reward_fn(
+        response_text="".join(block["text"] for block in content if "text" in block),
         ground_truth=payload["answer"],
     )
-    return {"rewards": rewards}
+    return {"reward": float(reward)}
 
 
 if __name__ == "__main__":
@@ -120,56 +112,28 @@ class MyReward(RewardFunction):
 
 ## Deploy to AgentCore Runtime
 
-Once the code is adapted, deploy with the
-[`bedrock-agentcore-starter-toolkit`](https://github.com/aws/bedrock-agentcore-starter-toolkit)
-CLI. A minimal deploy:
+The container must implement the Runtime's
+[HTTP contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html):
+serve `/invocations` and `/ping` on port 8080 by default. `AgentCoreRuntimeApp`
+provides these endpoints. The examples use ARM64 images built through the
+[Python AgentCore CLI](https://github.com/aws/bedrock-agentcore-starter-toolkit) and CodeBuild.
 
-```bash
-agentcore configure \
-    --entrypoint rl_app.py \
-    --name my_rl_agent \
-    --requirements-file pyproject.toml \
-    --deployment-type container \
-    --non-interactive
-agentcore deploy --agent my_rl_agent
-```
+The Runtime must be able to reach the inference server or rollout gateway.
+For a private endpoint, deploy into a VPC that routes to it and allows traffic
+on its TCP port. Container builds also need access to dependency sources.
+
+Each example README includes its deployment commands. For CLI setup, see
+[installation](/agentcore-rl-toolkit/guides/installation/#install-the-deployment-cli).
 
 A successful deploy prints the **agent runtime ARN** — that's the
-one thing the training backend needs to reach this agent. Pair it
-with your **S3 bucket name** (where rewards will land) and you have
-the full set of hand-off values for the training backend. For example, they drop directly
-into the slime backend's hook config:
+identifier the training backend uses to invoke the agent. For verl and slime,
+configure the HTTP session backend:
 
 ```yaml
-agent_runtime_arn: "arn:aws:bedrock-agentcore:us-west-2:..."
-s3_bucket: "your-bucket-name"
+rollout_session_backend:
+  backend: agentcore_rl_toolkit.rollout_session.agentcore_http_session.AgentCoreHttpSession
+  agentcore_runtime_arn: "arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/AGENT_ID"
 ```
-
-:::note[Notes]
-- **Deployment options are evolving.** AgentCore currently ships two deployment
-  paths — the older
-  [`bedrock-agentcore-starter-toolkit`](https://github.com/aws/bedrock-agentcore-starter-toolkit)
-  (what the examples use; `agentcore configure` / `agentcore deploy`)
-  and the newer
-  [`aws/agentcore-cli`](https://github.com/aws/agentcore-cli)
-  (`agentcore create` / `agentcore deploy`). Flag names and defaults
-  differ. Examples in this repo track the starter toolkit today;
-  expect this guide to migrate as `aws/agentcore-cli` stabilizes.
-- **VPC visibility.** If your inference server (vLLM / SGLang /
-  gateway) lives in a private VPC, deploy the agent into the same
-  VPC with `agentcore configure ... --vpc --subnets subnet-0abc...
-  --security-groups sg-0def...` — otherwise AgentCore's default
-  public network route can't reach a private endpoint.
-:::
-
-For a worked end-to-end deploy (IAM role, ECR push, first-time AWS
-setup), see the
-[Strands Math Agent example](/agentcore-rl-toolkit/examples/strands-math-agent/).
-For containerized or advanced deploys (custom Dockerfiles, direct
-code deployment, non-CLI workflows), see AWS's
-[Get started with AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-getting-started.html)
-and its
-[custom / without-CLI path](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/getting-started-custom.html).
 
 ## Next
 

@@ -4,7 +4,7 @@ AgentCore Runtime with token capture through the in-repo rollout gateway.
 Per rollout: create a gateway session keyed by a fresh uuid → invoke the ACR
 agent with that uuid as the ACR ``runtimeSessionId`` (the container places it in
 its LLM client's api-key slot, which the gateway reads as the Bearer sid) → await
-the agent's S3 result (the completion signal; may carry an inline reward) →
+the agent's background HTTP invocation result (including its scalar reward) →
 drain the gateway session into TraceRecords → reshape each into an
 ``AgentLoopOutput``.
 
@@ -16,85 +16,36 @@ sub-agent forks), which only the v1 TransferQueue path consumes.
 
 import asyncio
 import logging
-import random
+import math
 import time
 import uuid
 from typing import Any
 
+import ray
+from pydantic import ValidationError
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopMetrics,
     AgentLoopOutput,
 )
 
-from agentcore_rl_toolkit.client import RolloutClient
+from agentcore_rl_toolkit.aws_tools.persistent_dict import NullPersister, PersistentDict
+from agentcore_rl_toolkit.concurrency.ray_adapters import RayPrioritySemaphore, RayRateLimiter
 from agentcore_rl_toolkit.rollout_gateway import BaseTrace, TraceRecord
+from agentcore_rl_toolkit.rollout_session.errors import RolloutContractError
+from agentcore_rl_toolkit.rollout_session.factory import make_session
 
 from .gateway_host import GatewayHandle, get_or_start_gateway
-from .rollout_failure import (
-    TIMEOUT_POLICIES,
-    RolloutDropped,
-    classify_failure,
-    log_failure,
-    record_failure,
-)
 
 logger = logging.getLogger(__name__)
 
-# Jittered pause before retrying a transient failure, in seconds (tests shorten it).
-_RETRY_BACKOFF_S = (2.0, 5.0)
 
-# Agent loops are instantiated per trajectory, so same-config instances MUST share
-# one client: the client owns the LocalRateLimiter, and a fresh limiter per instance
-# means no effective rate limiting toward ACR's per-ARN TPS cap. Keyed by config
-# rather than a process singleton so distinct ARNs get distinct clients. Only ever
-# touched from the AgentLoopWorker's asyncio thread (RolloutClient isn't thread-safe).
-_CLIENTS: dict[tuple, RolloutClient] = {}
-
-
-def _get_or_create_client(
-    *, agent_runtime_arn: str, s3_bucket: str, exp_id: str, tps_limit: int, max_pool_connections: int
-) -> RolloutClient:
-    key = (agent_runtime_arn, s3_bucket, exp_id, tps_limit, max_pool_connections)
-    client = _CLIENTS.get(key)
-    if client is None:
-        client = _CLIENTS[key] = RolloutClient(
-            agent_runtime_arn=agent_runtime_arn,
-            s3_bucket=s3_bucket,
-            exp_id=exp_id,
-            tps_limit=tps_limit,
-            max_pool_connections=max_pool_connections,
-        )
-    return client
-
-
-def _reset_client_for_tests() -> None:
-    _CLIENTS.clear()
-
-
-def _extract_agent_reward(result: dict) -> float | None:
-    """The agent-reported reward from a session result (the ``{"rewards": ...}``
-    convention of ``@rollout_entrypoint`` apps: scalar, or last element of a
-    list), or ``None`` if the agent didn't report one.
-
-    A non-numeric value raises rather than scoring 0.0: broken reward code is broken
-    on every rollout, and zeros would flatten every GRPO group's advantages instead.
-    verl contains the raise per prompt group, so training continues.
-    """
-    rewards = result.get("rewards")
-    if rewards is None:
-        return None
-    if isinstance(rewards, list) and not rewards:
-        return None  # an empty list reports no reward
-    value = rewards[-1] if isinstance(rewards, list) else rewards
-    try:
-        return float(value)
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"The agent returned a non-numeric built-in reward: rewards={rewards!r} ({e}). "
-            "It must be a float, or a list of floats whose last element is the reward — "
-            "see the reward contract in backends/verl/README.md."
-        ) from e
+def _extract_agent_reward(result: dict) -> float:
+    """Reject missing/coerced rewards rather than silently flattening GRPO groups."""
+    reward = result.get("reward")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)) or not math.isfinite(reward):
+        raise ValueError(f"Expected a finite scalar agent reward, got {reward!r}")
+    return float(reward)
 
 
 # Deliberately NOT decorated with verl's @register: it stores a bare
@@ -114,29 +65,23 @@ class AgentCoreAgentLoop(AgentLoopBase):
         dataset_cls,
         data_config,
         *,
-        agent_runtime_arn: str,
-        s3_bucket: str,
+        rollout_session_backend: dict[str, Any],
         max_tokens_per_turn: int,
-        exp_id: str | None = None,
+        rollout_concurrency: int = 128,
         tps_limit: int = 5,
-        max_pool_connections: int = 100,
         max_rollout_time: float = 1800.0,
         gateway_bind_host: str = "0.0.0.0",
         gateway_port: int = 0,
         gateway_public_host: str | None = None,
         gateway_adapters: list[str] | None = None,
         max_turns_per_sid: int | None = None,
-        history_mode: str = "tree",
+        history_mode: str = "linear",
         linear_on_nonlinear: str = "reset",
         require_registered_sessions: bool = False,
         reward_mode: str = "built_in",
         reward_extra_info_defaults: dict | None = None,
         # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
         reward_thresholds: dict | None = None,
-        # Failure policy (see rollout_failure.py and the README's failure-handling section).
-        drop_agent_errors: bool = True,
-        max_rollout_retries: int = 1,
-        timeout_policy: str = "drop",
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -154,17 +99,10 @@ class AgentCoreAgentLoop(AgentLoopBase):
                 "reward_mode='separate' is not supported yet: verl's reward managers require "
                 "`data_source` and `reward_model.ground_truth` dataset columns, which the "
                 "payload-first dataset contract does not provide. Use reward_mode='built_in' "
-                "and have the agent return {'rewards': ...} in its session result."
+                "and have the agent return {'reward': ...} in its session result."
             )
         if reward_mode != "built_in":
             raise ValueError(f"reward_mode must be 'built_in', got {reward_mode!r}")
-        if timeout_policy not in TIMEOUT_POLICIES:
-            raise ValueError(f"timeout_policy must be one of {list(TIMEOUT_POLICIES)}, got {timeout_policy!r}")
-        if type(max_rollout_retries) is not int or max_rollout_retries < 0:  # noqa: E721 - reject bool
-            raise ValueError(f"max_rollout_retries must be a non-negative integer, got {max_rollout_retries!r}")
-        self.drop_agent_errors = bool(drop_agent_errors)
-        self.max_rollout_retries = max_rollout_retries
-        self.timeout_policy = timeout_policy
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -175,6 +113,12 @@ class AgentCoreAgentLoop(AgentLoopBase):
         # The two padded regions may sum past max_model_len; valid tokens never do.
         self.max_context_tokens = self.response_length
         self.max_rollout_time = max_rollout_time
+        self.rollout_session_backend = dict(rollout_session_backend)
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in (rollout_concurrency, tps_limit)
+        ):
+            raise ValueError("rollout_concurrency and tps_limit must be positive integers")
         # Kept as config, not inlined, so a validated trainer-side mode can land
         # without a signature change. Reward semantics: see the README.
         self.reward_mode = reward_mode
@@ -203,19 +147,8 @@ class AgentCoreAgentLoop(AgentLoopBase):
             linear_on_nonlinear=linear_on_nonlinear,
             require_registered_sessions=require_registered_sessions,
         )
-        # Default exp_id must be identical across all AgentLoopWorker processes of
-        # one run, so derive it from verl's run identity instead of inventing one.
-        trainer_cfg = self.config.trainer
-        project = trainer_cfg.get("project_name", "verl")
-        experiment = trainer_cfg.get("experiment_name", "run")
-        self._exp_id = exp_id or f"{project}-{experiment}"
-        self._client = _get_or_create_client(
-            agent_runtime_arn=agent_runtime_arn,
-            s3_bucket=s3_bucket,
-            exp_id=self._exp_id,
-            tps_limit=tps_limit,
-            max_pool_connections=max_pool_connections,
-        )
+        self._rollout_semaphore = RayPrioritySemaphore(ray.get_actor("rollout_concurrency_semaphore"))
+        self._session_rate_limiter = RayRateLimiter(ray.get_actor("session_create_rate_limiter"))
 
     def _validate_token_budgets(self, max_tokens_per_turn: int) -> None:
         if self.max_model_len is None or self.max_model_len <= 0:
@@ -246,83 +179,76 @@ class AgentCoreAgentLoop(AgentLoopBase):
     # TQ path accepts AgentLoopOutput | list[AgentLoopOutput] (one row per
     # trajectory-tree leaf); __init__ asserts trainer.use_v1 accordingly.
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput]:  # type: ignore[override]
+        sid = str(uuid.uuid4())  # gateway Bearer sid == ACR runtimeSessionId (36 chars >= ACR's 33 min)
         start = time.monotonic()
-        # The first attempt and every retry share one deadline, so a retried rollout
-        # never holds a synchronous step longer than an unretried one could.
-        deadline = start + self.max_rollout_time
-        global_steps = int(kwargs.get("global_steps", 0))
 
         # Built before any session/ACR state exists: a payload-contract violation
         # is a config error that would hit every rollout — raise it loudly rather
         # than degrading each rollout into an inert row.
         payload = self._build_payload(kwargs)
+        task = {
+            **payload,
+            "_config": {
+                "base_url": f"{self._gateway.base_url}/v1",
+                "model_id": self.model_id,
+                "api_key": sid,
+            },
+        }
 
-        gateway = self._gateway.gateway
-        attempt = 0
-        while True:
-            attempt += 1
-            sid = str(uuid.uuid4())  # gateway Bearer sid == ACR runtimeSessionId (36 chars >= ACR's 33 min)
-            gateway.create_session(
-                sid,
-                sampling_defaults=self._sampling_defaults(sampling_params),
-                max_context_tokens=self.max_context_tokens,
-            )
-            result, error, phase = await self._invoke_once(payload, sid, kwargs, deadline)
+        await self._gateway.create_session(
+            sid,
+            sampling_defaults=self._sampling_defaults(sampling_params),
+            max_context_tokens=self.max_context_tokens,
+        )
 
-            failure_class: str | None = None
-            if error is not None:
-                # Read the per-session signals before the session is drained.
-                failure_class = classify_failure(
-                    phase=phase,
-                    status_code=result.get("status_code"),
-                    num_turns=gateway.manager.turn_count(sid),
-                    context_exhausted=gateway.context_exhausted(sid),
-                    last_finish_reason=gateway.manager.last_finish_reason(sid),
-                    timeout_policy=self.timeout_policy,
-                )
-            if failure_class == "transient" and attempt <= self.max_rollout_retries:
-                backoff = random.uniform(*_RETRY_BACKOFF_S)
-                if time.monotonic() + backoff < deadline:
-                    await self._report_failure("transient", "retry", sid, global_steps, error)
-                    await gateway.drop_session(sid)
-                    self._gateway.backend.pop_extra_fields(sid)
-                    await asyncio.sleep(backoff)
-                    continue
-                error = f"{error} (no time left in max_rollout_time to retry)"
-            break
+        result: dict[str, Any] = {}
+        error: str | None = None
+        try:
+            state = PersistentDict({"session_id": sid}, persister=NullPersister())
+            session = make_session(sid, self.rollout_session_backend, state)
+            async with self._rollout_semaphore.slot(), session:
+                await self._session_rate_limiter.wait_async()
+                async with asyncio.timeout(self.max_rollout_time):
+                    await session.setup(task)
+                    dump = await session.run(task)
+            result = dump.task_output or {}
+            error = dump.exception
+        except (RolloutContractError, ValidationError):
+            raise
+        except asyncio.TimeoutError:
+            error = f"rollout timed out after {self.max_rollout_time}s"
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        if error:
+            logger.warning("ACR rollout failed (sid=%s): %s", sid, error)
 
-        num_turns = gateway.manager.turn_count(sid)
-        records = await gateway.finish_session(sid, base_sample=BaseTrace(rollout_id=sid), reward=0.0)
-        records = [r for r in records if r.token_ids]
-        engine_extra = self._gateway.backend.pop_extra_fields(sid)
+        capture = await self._gateway.finish_session(sid, base_sample=BaseTrace(rollout_id=sid), reward=0.0)
+        num_turns = capture.num_turns
+        records = [r for r in capture.records if r.token_ids]
+        engine_extra = capture.extra_fields
         elapsed = time.monotonic() - start
 
         if not records:
-            self._warn_if_static_session_capture(sid)
-        if failure_class is not None:
-            action = self._failure_action(failure_class, has_records=bool(records))
-            await self._report_failure(failure_class, action, sid, global_steps, error)
-            if action == "drop":
-                raise RolloutDropped(failure_class, f"sid={sid} attempts={attempt}: {error}")
-        elif not records:
-            raise RuntimeError(
-                f"ACR rollout produced no trainable trajectory (sid={sid}): no model turns were captured"
-            )
+            await self._warn_if_static_session_capture(sid)
+            reason = error or "no model turns were captured"
+            raise RuntimeError(f"ACR rollout produced no trainable trajectory (sid={sid}): {reason}")
 
         reward = self._resolve_reward(result, error, sid)
 
         # v1's staleness metrics do int(tag["min_global_steps"]) — the tags must
         # always be real ints. The engine's extra_fields carry them for turns it
         # served; default to the dataloader step otherwise.
+        global_steps = int(kwargs.get("global_steps", 0))
         shared_extra = {
-            # the session result is parsed JSON (RolloutFuture json.loads it) —
+            # the session result is parsed JSON —
             # already plain python, no sanitizing needed
             "acr_result": result,
             "acr_session_id": sid,
-            "num_trace_records": len(records),
-            "rollout_attempts": attempt,
+            "metrics": {
+                "acr_failed": float(error is not None),
+                "num_trace_records": float(len(records)),
+            },
             **({"acr_error": error} if error else {}),
-            **({"rollout_failure_class": failure_class} if failure_class else {}),
             "min_global_steps": global_steps,
             "max_global_steps": global_steps,
             **{k: v for k, v in engine_extra.items() if v is not None},
@@ -339,16 +265,14 @@ class AgentCoreAgentLoop(AgentLoopBase):
             primary = max(range(len(records)), key=lambda i: sum(records[i].loss_mask))
             records.append(records.pop(primary))
 
-        shared_extra["reward_extra_info"] = self._reward_extra_info(
-            result, reward, len(records), failed=error is not None
-        )
+        shared_extra["reward_extra_info"] = self._reward_extra_info(result, reward)
 
         outputs = [
             self._record_to_output(r, i, reward, num_turns, shared_extra, elapsed) for i, r in enumerate(records)
         ]
         return outputs
 
-    def _reward_extra_info(self, result: dict[str, Any] | None, reward: float, n_records: int, *, failed: bool) -> dict:
+    def _reward_extra_info(self, result: dict[str, Any] | None, reward: float) -> dict:
         info: dict[str, float] = dict(self._rei_defaults)
         metrics = (result or {}).get("metrics") or {}
         if isinstance(metrics, dict):
@@ -363,111 +287,31 @@ class AgentCoreAgentLoop(AgentLoopBase):
         info["agent_reward"] = float(reward)
         for name, threshold in self._reward_thresholds.items():
             info[name] = 1.0 if float(reward) >= threshold else 0.0
-        info["acr_failed"] = 1.0 if failed else 0.0
-        info["num_trace_records"] = float(n_records)
         return info
 
     # -- helpers ---------------------------------------------------------------
 
-    async def _invoke_once(
-        self, payload: dict[str, Any], sid: str, kwargs: dict[str, Any], deadline: float
-    ) -> tuple[dict[str, Any], str | None, str | None]:
-        """One invoke + wait. Returns ``(result, error, phase)``: ``phase`` is where it
-        failed (``"invoke"``, ``"poll"``, ``"timeout"``), or ``None`` if a result arrived;
-        ``error`` is ``None`` only for a ``status_code`` 200 (or absent) result."""
-        try:
-            future = await self._client.invoke_async(
-                payload,
-                session_id=sid,
-                input_id=str(kwargs.get("uid", sid)),
-                # OpenAI-SDK convention: base_url includes the /v1 prefix (the
-                # client appends /chat/completions); agents pass it verbatim.
-                # TODO: not directly usable by Anthropic-SDK agents (that SDK
-                # appends /v1/messages without normalizing an existing /v1).
-                base_url=f"{self._gateway.base_url}/v1",
-                model_id=self.model_id,
-                # The gateway keys trajectory capture off the api-key slot; hand the
-                # agent its session key explicitly instead of relying on the agent
-                # deriving it from the ACR runtime session id (sid doubles as the
-                # runtimeSessionId, so older agent images that still send
-                # context.session_id produce the same value).
-                api_key=sid,
-            )
-        except Exception as e:
-            return {}, f"{type(e).__name__}: {e}", "invoke"
-
-        timed_out = f"rollout timed out after {self.max_rollout_time}s"
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            await self._cancel_quietly(future)
-            return {}, timed_out, "timeout"
-        try:
-            result = await future.result_async(timeout=remaining)
-        except asyncio.TimeoutError:
-            return {}, timed_out, "timeout"  # result_async cancels the ACR session itself
-        except Exception as e:
-            # Stop the old ACR session before a retry starts a new one.
-            await self._cancel_quietly(future)
-            return {}, f"{type(e).__name__}: {e}", "poll"
-
-        status_code = result.get("status_code")
-        if status_code is not None and status_code != 200:
-            # Agent-side failure saved to S3; a partial trace may still exist.
-            return result, f"agent returned status_code={status_code}: {result.get('stop_reason', 'unknown')}", None
-        return result, None, None
-
-    @staticmethod
-    async def _cancel_quietly(future: Any) -> None:
-        try:
-            await future.cancel_async()
-        except Exception:
-            logger.debug("ACR session cancel failed", exc_info=True)
-
-    def _failure_action(self, failure_class: str, *, has_records: bool) -> str:
-        """``train`` (reward 0) or ``drop`` for a failure that will not be retried."""
-        if failure_class == "model":
-            trains = True
-        elif failure_class == "agent_error":
-            trains = not self.drop_agent_errors
-        else:  # transient (retries exhausted) and timeout
-            trains = False
-        return "train" if trains and has_records else "drop"
-
-    @staticmethod
-    async def _report_failure(failure_class: str, action: str, sid: str, step: int, reason: str | None) -> None:
-        log_failure(failure_class, action, sid, step, reason or "")
-        await record_failure(step, failure_class, action)
-
     def _resolve_reward(self, result: dict[str, Any], error: str | None, sid: str) -> float:
         """The rollout's reward_score, which becomes rm_scores directly (verl
         skips reward computation for this rollout). The agent owns scoring;
-        failures and contract violations score 0."""
+        failures with a partial trajectory score 0."""
         if error is not None:
             return 0.0
-        agent_reward = _extract_agent_reward(result)
-        if agent_reward is None:
-            logger.warning(
-                "The agent returned no {'rewards': ...} for rollout %s; scoring 0.0. "
-                "The agent owns scoring — return the reward in its session result "
-                "(see the reward contract in backends/verl/README.md).",
-                sid,
-            )
-            return 0.0
-        return agent_reward
+        return _extract_agent_reward(result)
 
-    def _warn_if_static_session_capture(self, sid: str) -> None:
+    async def _warn_if_static_session_capture(self, sid: str) -> None:
         """Diagnose the stale-agent-image failure mode (see the warning below).
 
         Warn only, never drop the session: the adapters accept unseen keys by design
         (that is how local runs work) and "EMPTY" is legitimate for local/eval traffic.
         Without this, the misconfiguration trains nothing, silently."""
-        manager = self._gateway.gateway.manager
-        for static_sid in ("EMPTY", "default"):
-            if manager.turn_count(static_sid):
+        counts = await self._gateway.session_turn_counts(("EMPTY", "default"))
+        for static_sid, count in counts.items():
+            if count:
                 logger.warning(
                     "Rollout %s captured no trace, but turns are accumulating under the "
                     "static session %r — the deployed agent is likely sending a fixed "
-                    "api_key instead of context.session_id (stale agent image?). "
+                    "api_key instead of _config.api_key (stale agent image?). "
                     "See the agent-side contract in backends/verl/README.md.",
                     sid,
                     static_sid,
@@ -490,6 +334,8 @@ class AgentCoreAgentLoop(AgentLoopBase):
         """
         payload = kwargs.get("payload")
         if isinstance(payload, dict):
+            if "_config" in payload or "_agentcore_runtime" in payload:
+                raise ValueError("Dataset payload must not contain reserved fields '_config' or '_agentcore_runtime'")
             return payload
         raise ValueError(
             "Cannot build the agent payload: the dataset row has no `payload` column. "
@@ -543,4 +389,4 @@ class AgentCoreAgentLoop(AgentLoopBase):
         )
 
 
-__all__ = ["AgentCoreAgentLoop", "RolloutDropped"]
+__all__ = ["AgentCoreAgentLoop"]

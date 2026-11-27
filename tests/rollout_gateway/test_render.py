@@ -2,8 +2,8 @@
 
 Rendering uses a locally built HF/Rust tokenizer, compared directly with HF's
 apply_chat_template. Parsing uses small stubs. Neither needs model downloads.
-The schema-derender path (recognized chat template -> tokenizer.parse_response) is
-covered in test_response_schemas.py; this module covers the two-stage fallback.
+The template-derender path (recognized chat template -> response parser) is
+covered in test_response_templates.py; this module covers the two-stage fallback.
 """
 
 import asyncio
@@ -41,7 +41,7 @@ async def test_render_passes_expected_kwargs_and_returns_list(fast_tokenizer):
 def test_parse_no_tools_returns_plain_text():
     tok = StubTokenizer()
     r = HfTemplateRenderer(tok)
-    out = r.parse([1, 2, 3], tools_schema=None)
+    out = r.parse([1, 2, 3], finish_reason="stop", tools_schema=None)
     assert isinstance(out, ParsedOutput)
     assert out.text == "1 2 3"
     assert out.tool_uses == []
@@ -51,7 +51,7 @@ def test_parse_no_tools_returns_plain_text():
 def test_parse_empty_output():
     tok = StubTokenizer()
     r = HfTemplateRenderer(tok)
-    out = r.parse([], tools_schema=None)
+    out = r.parse([], finish_reason="stop", tools_schema=None)
     assert out.text == ""
     assert out.tool_uses == []
 
@@ -68,7 +68,7 @@ def test_xml_tool_calls_parsed_dependency_free():
 
     r = HfTemplateRenderer(XmlTok(), tool_parser=parse_tool_uses)
     tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
-    out = r.parse([1], tools_schema=tools)
+    out = r.parse([1], finish_reason="stop", tools_schema=tools)
     assert "sglang" not in sys.modules and "vllm" not in sys.modules
     assert len(out.tool_uses) == 1
     assert out.tool_uses[0]["name"] == "search"
@@ -83,7 +83,7 @@ def test_parse_extracts_reasoning_from_think_block():
             return "<think>weighing options</think>the answer is 4"
 
     r = HfTemplateRenderer(ThinkTok())
-    out = r.parse([1], tools_schema=None)
+    out = r.parse([1], finish_reason="stop", tools_schema=None)
     assert out.reasoning == "weighing options"
     assert out.text == "the answer is 4"
 
@@ -115,7 +115,7 @@ def test_stages_run_in_sequence_reasoning_then_tools():
         return "T", [{"name": "x", "input": {}}], True
 
     r = HfTemplateRenderer(ThinkTok(), reasoning_parser=reasoning_parser, tool_parser=tool_parser)
-    out = r.parse([1], tools_schema=TOOLS)
+    out = r.parse([1], finish_reason="stop", tools_schema=TOOLS)
 
     assert seen["raw"] == "<think>hmm</think>body"  # reasoning stage sees raw text
     assert seen["body"] == "BODY"  # tool stage sees the reasoning stage's remainder
@@ -130,7 +130,7 @@ def test_tool_parser_override_keeps_default_reasoning_split():
         return "", [{"name": "x", "input": {"got": body_text}}], False
 
     r = HfTemplateRenderer(ThinkTok(), tool_parser=tool_parser)
-    out = r.parse([1], tools_schema=TOOLS)
+    out = r.parse([1], finish_reason="stop", tools_schema=TOOLS)
     assert out.reasoning == "hmm"
     assert out.tool_uses == [{"name": "x", "input": {"got": "body"}}]
 
@@ -148,11 +148,13 @@ def test_reasoning_parser_override_requires_explicit_tool_parser_for_tools():
         left, right = raw.split("||", 1)
         return left, right
 
-    with pytest.raises(ValueError, match="matched no response schema"):
-        HfTemplateRenderer(XmlTok(), reasoning_parser=split_on_bars).parse([1], tools_schema=TOOLS)
+    with pytest.raises(ValueError, match="matched no response template"):
+        HfTemplateRenderer(XmlTok(), reasoning_parser=split_on_bars).parse(
+            [1], finish_reason="stop", tools_schema=TOOLS
+        )
 
     r = HfTemplateRenderer(XmlTok(), reasoning_parser=split_on_bars, tool_parser=parse_tool_uses)
-    out = r.parse([1], tools_schema=TOOLS)
+    out = r.parse([1], finish_reason="stop", tools_schema=TOOLS)
     assert out.reasoning == "REASON"
     assert out.tool_uses == [{"name": "x", "input": {"q": "v"}}]
 
@@ -165,7 +167,7 @@ def test_tool_parser_skipped_without_tools_schema():
         return "", [], False
 
     r = HfTemplateRenderer(ThinkTok(), tool_parser=tool_parser)
-    out = r.parse([1], tools_schema=None)
+    out = r.parse([1], finish_reason="stop", tools_schema=None)
     assert calls == []  # no tools -> tool stage never runs
     assert out.reasoning == "hmm"
     assert out.text == "body"
@@ -292,6 +294,12 @@ async def test_delta_uses_real_history_and_only_encodes_new_text(fast_tokenizer,
     assert all("OLD_HISTORY" not in call.args[0] for call in encode.call_args_list)
 
 
+def _record(manager, *, prompt_ids, output_ids, messages, response):
+    """Record one generated turn, as the adapter does after serving it."""
+    turn = TurnRecord(prompt_ids=list(prompt_ids), output_ids=list(output_ids), finish_reason="stop")
+    manager.record_turn("s", turn=turn, prompt_messages=messages, response_message=response)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["", "<|im_end|>", "<|im_end|>\n"])
 async def test_delta_healing_preserves_multiturn_tokens_and_training_masks(fast_tokenizer, ending):
@@ -299,8 +307,8 @@ async def test_delta_healing_preserves_multiturn_tokens_and_training_masks(fast_
     renderer = HfTemplateRenderer(tok)
     full_renderer = HfTemplateRenderer(tok)
     full_renderer.render_delta = None  # Exercise the existing full-history oracle.
-    healers = [LinearHealer(renderer), LinearHealer(full_renderer)]
-    managers = [TrajectoryManager() for _ in healers]
+    managers = [TrajectoryManager(), TrajectoryManager()]
+    healers = [LinearHealer(renderer, managers[0]), LinearHealer(full_renderer, managers[1])]
     history = [{"role": "user", "content": "Inspect the project."}]
     generated_ids = []
     with patch.object(renderer, "render_delta", wraps=renderer.render_delta) as delta:
@@ -311,15 +319,7 @@ async def test_delta_healing_preserves_multiturn_tokens_and_training_masks(fast_
             output = tok.encode(f"Actually generated  {i}" + ending, add_special_tokens=False)
             generated_ids.extend(output)
             response = {"role": "assistant", "content": f"Canonical message {i}"}
-            for h, manager, prompt in zip(healers, managers, prompts, strict=True):
-                h.commit(
-                    "s",
-                    fed_prompt_ids=prompt,
-                    output_ids=output,
-                    messages=history,
-                    response_message=response,
-                    tools=None,
-                )
+            for manager, prompt in zip(managers, prompts, strict=True):
                 manager.record_turn(
                     "s",
                     turn=TurnRecord(
@@ -364,14 +364,14 @@ async def test_delta_declines_unsafe_template_and_preserves_fallback(fast_tokeni
     new = [{"role": "tool", "content": "result"}]
     assert await renderer.render_delta(prior + [last], new) is None
     seed = await renderer.render(prior)
-    healers = [LinearHealer(r) for r in (renderer, oracle)]
+    healers = [LinearHealer(r, TrajectoryManager()) for r in (renderer, oracle)]
     results = []
     for h in healers:
-        h.commit("s", fed_prompt_ids=seed, output_ids=[42], messages=prior, response_message=last, tools=None)
+        _record(h.manager, prompt_ids=seed, output_ids=[42], messages=prior, response=last)
         results.append(await h.heal("s", prior + [last] + new, None))
     assert results[0] == results[1]
     assert healers[0].counters == healers[1].counters
-    assert healers[0].counters["nonlinear"] == 1
+    assert healers[0].counters["unhealable"] == 1
 
 
 @pytest.mark.asyncio
@@ -391,13 +391,13 @@ async def test_delta_keeps_served_prefix_when_bpe_can_merge_across_boundary():
         ),
     )
     r = HfTemplateRenderer(tok)
-    h = LinearHealer(r)
+    h = LinearHealer(r, TrajectoryManager())
     prior = [{"role": "user", "content": "q"}]
     last = {"role": "assistant", "content": "answer"}
     new = [{"role": "tool", "content": "result"}]
     seed = await h.heal("s", prior, None)
     output = tok.encode("answer<|im_end|>", add_special_tokens=False)
-    h.commit("s", fed_prompt_ids=seed, output_ids=output, messages=prior, response_message=last, tools=None)
+    _record(h.manager, prompt_ids=seed, output_ids=output, messages=prior, response=last)
     actual = await h.heal("s", prior + [last] + new, None)
     full = await r.render(prior + [last] + new)
     # Separate newline tokens decode identically to the full encoder's merged

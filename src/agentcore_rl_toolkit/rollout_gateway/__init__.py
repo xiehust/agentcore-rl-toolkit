@@ -18,14 +18,16 @@ Import layering:
 from .linear import LinearHealer
 from .render import HfTemplateRenderer, ParsedOutput, Renderer
 from .sampling_backends.base import SamplingBackend
-from .trace import BaseTrace, Status, TraceRecord
-from .trajectory import MessageNode, TrajectoryManager, TurnRecord
+from .trace import BaseTrace, Status, TopLogprobs, TraceRecord
+from .trajectory import HealAnchor, MessageNode, TrajectoryManager, TurnRecord
 
 # RolloutGateway is aiohttp-dependent, so it is NOT imported at module top — it is
 # exposed lazily via __getattr__ below to keep `import ...rollout_gateway` aiohttp-free.
 
 __all__ = [
     "BaseTrace",
+    "GatewayServer",
+    "HealAnchor",
     "HfTemplateRenderer",
     "LinearHealer",
     "MessageNode",
@@ -35,6 +37,7 @@ __all__ = [
     "SamplingBackend",
     "Status",
     "ThreadedGatewayServer",
+    "TopLogprobs",
     "TraceRecord",
     "TrajectoryManager",
     "TurnRecord",
@@ -47,8 +50,8 @@ def __getattr__(name: str):
         from .gateway import RolloutGateway
 
         return RolloutGateway
-    if name == "ThreadedGatewayServer":
-        from .server import ThreadedGatewayServer
+    if name in ("GatewayServer", "ThreadedGatewayServer"):
+        from . import server
 
-        return ThreadedGatewayServer
+        return getattr(server, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

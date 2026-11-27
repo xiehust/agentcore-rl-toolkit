@@ -1,7 +1,7 @@
-# verl backend (rollout gateway)
+# Training AgentCore agents with verl
 
 Train agents deployed on Bedrock AgentCore Runtime (ACR) with [verl](https://github.com/volcengine/verl),
-using the in-repo [rollout gateway](../../rollout_gateway/) for token-level trajectory
+using the [rollout gateway](../../rollout_gateway/) for token-level trajectory
 capture.
 
 The integration uses verl's public v1 agent-loop interface. Replay buffering,
@@ -76,51 +76,45 @@ each step remain stable. See the
 [variable-row batching design](../../../../designs/verl_variable_trajectory_batching.md)
 for the derivation.
 
-## How it works
+## Rollouts and trajectory capture
 
 ```
 verl main_ppo (v1) ──> AgentLoopWorker ──> AgentCoreAgentLoop.run()
                                              │  1. create gateway session (sid = uuid4)
-                                             │  2. RolloutClient.invoke_async(session_id=sid,
-                                             │       base_url=<gateway>/v1)  ────────────> ACR agent
+                                             │  2. AgentCoreHttpSession.run(task)
+                                             │       _config.base_url=<gateway>/v1  ────────────> ACR agent
    RolloutGateway (thread, this process) <───┼─────  agent's OpenAI/Anthropic calls
      └─ VerlSamplingBackend ──> verl LLMServerClient (token-in/token-out, sticky by sid)
-                                             │  3. await S3 result (completion signal + optional reward)
+                                             │  3. await result (completion + scalar reward)
                                              │  4. finish_session -> TraceRecords -> AgentLoopOutputs
 ```
 
-- The **capture session key travels in the payload**: the loop generates one sid per
-  rollout, passes it as both the ACR `runtimeSessionId` and `_rollout.api_key`; the
-  agent container puts `payload["_rollout"]["api_key"]` in its LLM client's api-key
-  slot; the gateway reads it back from the Bearer/`X-Api-Key` slot.
+- Each rollout uses one session ID for ACR's `runtimeSessionId` and `_config.api_key`.
+  The agent forwards this key through its LLM client; the gateway reads it from
+  the Bearer/`X-Api-Key` header to identify the capture session.
 - The advertised `base_url` follows the OpenAI-SDK convention and **includes `/v1`**
   (the SDK appends `/chat/completions`) — pass it to an OpenAI-compatible client
   verbatim. TODO: it is not directly usable by Anthropic-SDK agents (that SDK
   appends `/v1/messages` and does not normalize an existing `/v1`, yielding
   `/v1/v1/messages`); how to serve both SDK families cleanly is unresolved.
-- One gateway per AgentLoopWorker process, serving on an auto-assigned port.
-  **ACR containers must be able to reach the trainer's CPU nodes on that port.**
-  Use `gateway_public_host` if the Ray node IP is not what ACR can reach.
-- A session's trajectory tree can fork (sub-agents, context compaction); every leaf
-  becomes its own training row (`run()` returns `list[AgentLoopOutput]`) — hence the
-  hard `trainer.use_v1=true` requirement.
-
-**Securing the gateway port.** By default the gateway opens a session on the first
-turn it sees for any Bearer, so if the port is reachable from outside a trusted
-network a stranger can POST `/v1/chat/completions` with an arbitrary Bearer — free
-inference plus garbage trajectory trees in the trainer. Set
-`require_registered_sessions: true` (on `AgentCoreAgentLoop`, forwarded to
-`get_or_start_gateway`/`RolloutGateway`) to refuse any sid the loop did not
-pre-register via `create_session` with a `401`; health and `/v1/models` probes stay
-unauthenticated. It defaults to `false` (unchanged behaviour) and is process-shared
-like `gateway_port` — the first agent loop's value wins. **Recommended whenever the
-gateway port is reachable from outside a trusted network** (public networking mode,
-NAT, or any setup where the trainer nodes are not on an isolated VPC).
+- Each `AgentLoopWorker` hosts one gateway on a background thread and an
+  auto-assigned port. Its [handle](../../../../designs/gateway_serving_and_workers.md)
+  dispatches session operations to the gateway's event loop.
+  **ACR containers must be able to reach that port.** Set `gateway_public_host`
+  if the Ray node IP is not reachable from ACR.
+- By default the gateway opens a capture session on the first turn for any key.
+  If the port is reachable from outside a trusted network, set
+  `require_registered_sessions: true` on `AgentCoreAgentLoop`: turns whose key the
+  loop did not register via `create_session` get `401`, while `/healthz` and
+  `/v1/models` stay unauthenticated. Like `gateway_port`, it is process-shared
+  (the first agent loop's value wins).
+- A trajectory tree can fork; each leaf becomes a training row.
+  `run()` returns `list[AgentLoopOutput]`, requiring `trainer.use_v1=true`.
 
 The agent must forward the trainer-supplied key when it constructs its model client:
 
 ```python
-rollout_config = payload["_rollout"]
+rollout_config = payload["_config"]
 api_key = rollout_config.get("api_key") or "EMPTY"
 model = OpenAIModel(
     client_args={"api_key": api_key, "base_url": rollout_config["base_url"]},
@@ -134,7 +128,7 @@ endpoints.
 
 ## Install
 
-verl is pinned to version 0.9.0. From a checkout of this repo:
+From a checkout of this repo:
 
 ```bash
 uv sync --extra verl
@@ -152,29 +146,7 @@ Megatron requires Python 3.12:
 uv sync --extra verl --group verl-megatron
 ```
 
-- Use NVIDIA Megatron-Bridge with `megatron.use_mbridge=True` and
-  `megatron.vanilla_mbridge=False`.
-
-#### Context parallelism on VL models: apply the megatron-bridge patch
-
-**Required for `context_parallel_size > 1` on a vision-language architecture** (e.g. Qwen3.6-27B / `Qwen3_5ForConditionalGeneration`, which carries a `vision_config` even when the task is text-only). Run it after every `uv sync`, since uv reinstalls the package and reverts the edit:
-
-```bash
-./patches/apply-megatron-bridge-cp-clamp.sh    # from the repo root; idempotent
-```
-
-To check whether it is currently applied:
-
-```bash
-grep -c "LOCAL PATCH (agentcore-rl-toolkit)" \
-  .venv/lib/python3.12/site-packages/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/utils.py
-```
-
-What it fixes: megatron-bridge's `qwen_vl` `preprocess_packed_seqs` pads each sequence to `align_size = tp * cp * 2`, then slices chunk one of the zigzag-CP split by position in the *padded* sequence while reading a buffer that holds only real tokens. It clamps chunk two but not chunk one, so any row shorter than `tp * cp` raises `RuntimeError: The expanded size of the tensor (N) must match the existing size (M)` from `actor_rollout_compute_log_prob` — i.e. the rollout completes in full and then the first training-side forward pass dies, so a single short row costs the whole batch. The patch clamps chunk one the same way chunk two already is; it is a no-op on rows long enough to split, verified byte-identical on normal-length rows.
-
-Short rows are not avoidable from config: verl synthesizes `prompt_len=1 / response_len=1` samples itself in `trainer/ppo/padding_utils.py` to make the batch divisible by the dp size. Nor is any `cp > 1` layout safer than another — the alignment depends on the `tp * cp` product, not on either alone.
-
-Text-only models (e.g. `Qwen3MoeForCausalLM`) take verl's own THD path, never reach this function, and need none of this.
+- Use NVIDIA Megatron-Bridge with `megatron.use_mbridge=True`.
 
 ## Dataset contract: the `payload` column
 
@@ -216,13 +188,11 @@ concerns inside `payload`.
 ## Rewards
 
 The reward is **built into the agent** (`reward_mode="built_in"`, the only supported
-mode): the agent returns `{"rewards": ...}` in its session result (scalar or list;
-last element wins). The score becomes `rm_scores` directly and verl skips reward
+mode): the agent returns `{"reward": ...}` in its session result (a finite scalar). The score becomes `rm_scores` directly and verl skips reward
 computation.
 
-- Failed rollouts that still train (see [Failure handling](#failure-handling)) score 0.0.
-- A healthy rollout that returns no reward is a contract violation: warned, scored 0.0.
-- A non-numeric `rewards` value raises because it indicates a recurring
+- Failed rollouts with captured tokens (timeout, ACR error, handler exception) score 0.0.
+- Missing, non-numeric, or non-finite `reward` values raise because it indicates a recurring
   agent-side contract error. verl contains the exception to the affected prompt
   group, so training continues without rows from that group.
 
@@ -238,7 +208,7 @@ the payload-first contract does not provide.
 ## Examples
 
 - [GSM8K with FSDP full fine-tuning](examples/math_agent/)
-- [MigrationBench with Megatron and LoRA](examples/migration_agent/)
+- [MigrationBench with Megatron and LoRA](../../../../examples/strands_migration_agent/train/verl/)
 - [Public setup guide](../../../../docs/site/src/content/docs/guides/verl-backend-setup.md)
 
 Each recipe separates verl configuration in its shell script from
@@ -302,70 +272,6 @@ session-level or partial-group failure handling in verl's replay buffer.
 The `training/rollout_failure/total_missing_sessions` metric reports
 `data.train_batch_size / parameter_sync_step * rollout.n` minus the number of
 materialized rollout sessions in each actor update, summed over a step's updates.
-
-## Failure handling
-
-A failed rollout is classified, then trained at reward 0, retried, or dropped. Rules
-match in order and never inspect error text:
-
-| Class | Matches | Action |
-|---|---|---|
-| `model` | the gateway answered a context-limit error for the session (`max_context_tokens` filled); the last captured turn ended with `finish_reason == "length"`; a timeout under `timeout_policy: penalize` | train at reward 0 (dropped if no tokens were captured) |
-| `timeout` | the `max_rollout_time` deadline passed (`timeout_policy: drop`) | drop |
-| `transient` | `invoke_async` raised (after boto retries), polling S3 raised, or `status_code == 500` with zero captured model turns | retry on a fresh session id, then drop |
-| `agent_error` | any other non-200 `status_code`, e.g. a traceback after model turns | drop (train at 0 with `drop_agent_errors: false`) |
-
-A non-numeric reward still raises, as described under [Rewards](#rewards).
-
-Dropping raises `RolloutDropped` (a `RuntimeError` with `.failure_class`) from the
-agent loop. With synchronous replay only that trajectory is lost, its siblings train,
-and it counts toward `total_missing_sessions`. With asynchronous replay, verl evicts
-and refills the whole prompt group (see above), so drops cost more there.
-
-A retry discards the old gateway session, waits a jittered 2–5 s, and invokes again
-under a new session id. The first attempt and all retries share one `max_rollout_time`
-deadline. No retry starts if the backoff would overrun the deadline, so a retried
-rollout never holds a step longer than an unretried one could.
-
-`agentcore_agent.yaml` kwargs:
-
-| Kwarg | Default | Meaning |
-|---|---|---|
-| `drop_agent_errors` | `true` | drop `agent_error` rollouts; `false` trains their partial traces at reward 0 (the old behaviour) |
-| `max_rollout_retries` | `1` | retries for `transient` failures; `0` drops them immediately |
-| `timeout_policy` | `drop` | `drop`, or `penalize` to train timed-out partial traces at reward 0 as `model` |
-
-Each decision logs one line at WARNING level:
-
-```text
-[rollout-failure] class=<model|transient|agent_error|timeout> action=<train|retry|drop> sid=<sid> step=<global_steps> reason=<first 200 chars, newlines replaced by spaces>
-```
-
-These lines come from agent-loop worker processes. Ray forwards worker output to the
-driver (`log_to_driver` defaults to true, and verl does not override it), with a
-`(AgentLoopWorker pid=...)` prefix and possibly a logging-format prefix, so match the
-line anywhere, not at the start. Ray's driver-side deduplication (`RAY_DEDUP_LOGS`,
-on by default) ignores words containing digits, so it collapses lines that differ only
-in sid or step when different workers emit them within 5 s. It prints them once
-followed by `[repeated Nx across cluster]`. Set
-`RAY_DEDUP_LOGS_ALLOW_REGEX='\[rollout-failure\]'` in the driver environment to keep
-every line, or count with the metrics below.
-
-`agentcore_sync` also reports, per step:
-
-- `training/rollout_failure/total_<class>_<action>` for `model_train`, `model_drop`,
-  `transient_retry`, `transient_drop`, `agent_error_train`, `agent_error_drop`, and
-  `timeout_drop`. Agent loops record each decision in a named Ray actor
-  (`agentcore_rollout_failure_stats`) that the trainer owns and reads at the end of
-  the step, before validation.
-- `training/rollout_failure/drop_fraction`: `total_missing_sessions` divided by
-  `data.train_batch_size * rollout.n`.
-
-If `drop_fraction` exceeds `trainer.v1.agentcore_max_drop_fraction` (default `0.5`;
-`null` disables the guard) for `trainer.v1.agentcore_drop_guard_steps` (default `3`)
-consecutive steps, the trainer raises `RolloutFailureGuardError` and includes the
-step's per-class counts in the message. Both keys are new to verl's config, so pass
-them with `+`, e.g. `+trainer.v1.agentcore_max_drop_fraction=0.3`.
 
 ## Troubleshooting
 

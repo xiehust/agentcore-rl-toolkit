@@ -22,21 +22,18 @@ uv pip install -e .
 python rl_app.py
 ```
 
-Deploy the same entrypoint to AgentCore Runtime via the
-[Prepare agent for RL → Deploy](/agentcore-rl-toolkit/guides/agent-adaptation/)
-flow, then feed the resulting runtime ARN into the
-[slime backend](/agentcore-rl-toolkit/guides/slime-backend-setup/)
-to train.
+Deploy using the commands in the
+[Math README](https://github.com/awslabs/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/README.md#deploy-with-the-agentcore-cli),
+then use its Runtime ARN in the
+[slime training configuration](/agentcore-rl-toolkit/guides/slime-backend-setup/).
 
 ## What's in the example
 
 - **`basic_app.py`** — deployment-ready reference using `BedrockModel`.
 - **`rl_app.py`** — RL-adapted version; reads `base_url` / `model_id`
-  from `_rollout`, returns `{"rewards": ...}`.
+  from `_config`, returns `{"reward": ...}`.
 - **`reward.py`** — `GSM8KReward`: extract the `####` answer, exact-match against ground truth.
-- **`evaluate.py`** — batch-evaluate a deployed ACR agent via `RolloutClient`.
+- **`evaluate.py`** — batch evaluation on GSM8K.
 
-For local setup (Bedrock credentials, local vLLM, S3 bucket,
-sending `curl` requests), Docker builds, ECR push, IAM setup, and
-full deploy instructions, see the
+For local setup, request examples, and GSM8K evaluation, see the
 [full README on GitHub](https://github.com/awslabs/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/README.md).
